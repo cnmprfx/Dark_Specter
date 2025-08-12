@@ -223,7 +223,13 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
         visited.add(url)
         if parent and url not in parent_map: parent_map[url] = parent
 
-        txt = fetch_text(session, url, timeout)
+        txt = fetch_text(
+    session, url, timeout,
+    verify_tls=not args.no_verify,
+    verbose=args.verbose,
+    save_debug=args.save_debug
+)
+
         total_fetched += 1
 
         if not txt:
