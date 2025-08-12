@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Dark Spectre - Tor Keyword Hunter (Recursive + Regex + JSON)
-import argparse, requests, sys, time, random, pathlib, re, json
+# Dark Spectre - Tor Keyword Hunter (Recursive + Regex + JSON + Auth)
+import argparse, requests, sys, time, random, pathlib, re, json, os
 from urllib.parse import urljoin, urlparse
 from collections import deque
 
@@ -23,28 +23,30 @@ ASCII_BANNER = rf"""
 {RESET}                ==== {RED}Dark {PURPLE}Spectre{RESET} - Tor Keyword Hunter ====
 """
 
-DESCRIPTION = f"""{RED}Dark Spectre{RESET} is a Tor-powered keyword hunter for darknet & clearnet URLs.
-It recursively follows links ONLY along branches where the keyword/phrase keeps re-appearing.
-Now supports regex searches and a JSON report with depth and parent chains.
-
-Example:
-  python3 dark_spectre.py urls.txt "ransom(ware|note)" --regex --max-depth 3 --json -o hits.txt --json-out hits.json
+DESCRIPTION = f"""{RED}Dark Spectre{RESET} hunts for keywords/regex on darknet & clearnet URLs via Tor.
+It recurses ONLY along links where the match keeps re-appearing.
+Now adds optional authentication: form login (with CSRF), Basic, or Bearer tokens.
 """
 
-class BannerHelp(argparse.RawTextHelpFormatter):
-    def add_usage(self, usage, actions, groups, prefix=None):
-        prefix = (f"{ASCII_BANNER}\n{DESCRIPTION}\n\n" if prefix is None else prefix)
-        return super().add_usage(usage, actions, groups, prefix=prefix)
-
+# ---------- Core helpers ----------
 def load_urls(path):
     with open(path, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
-def make_session(socks_host="127.0.0.1", socks_port=9050, ua=None):
+def make_session(socks_host="127.0.0.1", socks_port=9050, ua=None, cookie_jar=None):
     s = requests.Session()
     s.proxies = {"http": f"socks5h://{socks_host}:{socks_port}",
                  "https": f"socks5h://{socks_host}:{socks_port}"}
-    s.headers.update({"User-Agent": ua or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.2"})
+    s.headers.update({"User-Agent": ua or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.3"})
+    if cookie_jar:
+        try:
+            s.cookies = requests.cookies.cookiejar_from_dict({})
+            s.cookies.set_policy(None)
+            s.cookies = requests.cookies.RequestsCookieJar()
+            # Basic file-based jar compatibility
+            s.cookies.jar = None
+        except Exception:
+            pass
     return s
 
 def is_http_like(url):
@@ -56,15 +58,42 @@ def same_domain(u1, u2):
     h2 = (urlparse(u2).hostname or "").lower()
     return h1 == h2
 
-def fetch_text(session, url, timeout):
+def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug=False):
     try:
-        r = session.get(url, timeout=timeout, allow_redirects=True)
+        r = session.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            verify=verify_tls,
+            headers={
+                # a bit more “browsery”:
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate",  # requests handles decompression
+            },
+        )
         ct = r.headers.get("Content-Type", "")
-        if r.status_code == 200 and ("text" in ct or ct == "" or url.endswith(".onion")):
-            return r.text[:2_000_000]  # cap large pages
-    except requests.RequestException:
+        if verbose:
+            print(f"[http] {r.status_code} {ct} {url}")
+
+        # keep body for 2xx and 3xx — many challenge/redirect pages still contain readable text
+        if 200 <= r.status_code < 400 and ("text" in ct or ct == "" or url.endswith(".onion")):
+            html = r.text[:2_000_000]
+        else:
+            # For debugging, still capture body (may contain block/challenge text)
+            html = r.text[:2_000_000] if ("text" in ct) else None
+
+        if save_debug and html:
+            os.makedirs("debug_pages", exist_ok=True)
+            safe = url.replace("://", "_").replace("/", "_")[:120]
+            with open(os.path.join("debug_pages", f"{safe}.html"), "w", encoding="utf-8") as f:
+                f.write(html)
+
+        return html
+    except requests.RequestException as e:
+        if verbose:
+            print(f"[http] EXC {type(e).__name__}: {e} {url}")
         return None
-    return None
 
 def extract_links(base_url, html, allow_offdomain=False):
     links = set()
@@ -88,37 +117,111 @@ def build_matcher(phrase, use_regex):
         except re.error as e:
             print(f"Invalid regex: {e}", file=sys.stderr); sys.exit(2)
     else:
-        # literal, case-insensitive
         rx = re.compile(re.escape(phrase), re.IGNORECASE)
     return lambda text: (rx.search(text) is not None)
 
 def chain_for(url, parent_map):
-    chain = []
-    cur = url
-    seen = set()
+    chain, cur, seen = [], url, set()
     while cur and cur not in seen:
-        chain.append(cur)
-        seen.add(cur)
-        cur = parent_map.get(cur)
+        chain.append(cur); seen.add(cur); cur = parent_map.get(cur)
     chain.reverse()
     return chain
 
+# ---------- Authentication ----------
+def parse_kv_pairs(pairs):
+    out = {}
+    for p in pairs or []:
+        if "=" not in p:
+            print(f"{DIM}[auth] ignoring field (not k=v):{RESET} {p}")
+            continue
+        k,v = p.split("=",1)
+        out[k]=v
+    return out
+
+def get_csrf_value(html, selector, attr):
+    if not selector:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    el = soup.select_one(selector)
+    if not el:
+        return None
+    if attr.lower() == "text":
+        return el.get_text(strip=True)
+    return el.get(attr, None)
+
+def do_basic_auth(session, username, password):
+    session.auth = (username, password)
+    print(f"{PURPLE}[*]{RESET} Basic auth enabled")
+
+def do_bearer_auth(session, token, token_file):
+    if not token and token_file:
+        token = pathlib.Path(token_file).read_text(encoding="utf-8").strip()
+    if not token:
+        print(f"{DIM}[auth]{RESET} No bearer token provided"); return
+    session.headers["Authorization"] = f"Bearer {token}"
+    print(f"{PURPLE}[*]{RESET} Bearer token set")
+
+def do_form_auth(session, auth_url, method, username, password,
+                 user_field, pass_field, extra_fields, csrf_selector, csrf_attr,
+                 timeout, success_regex):
+    if not auth_url:
+        print(f"{DIM}[auth]{RESET} No auth URL provided for form mode"); return False
+    try:
+        r = session.get(auth_url, timeout=timeout, allow_redirects=True)
+    except requests.RequestException:
+        print(f"{DIM}[auth]{RESET} Failed to GET login page"); return False
+
+    payload = dict(extra_fields or {})
+    if username is not None and user_field:
+        payload[user_field] = username
+    if password is not None and pass_field:
+        payload[pass_field] = password
+
+    if csrf_selector:
+        token = get_csrf_value(r.text, csrf_selector, csrf_attr or "value")
+        if token is not None:
+            # Try to infer field name from selector if it's an <input name=...>
+            soup = BeautifulSoup(r.text, "html.parser")
+            el = soup.select_one(csrf_selector)
+            name = el.get("name") if el else None
+            if name:
+                payload[name] = token
+            else:
+                # generic key
+                payload["_csrf"] = token
+
+    method = method.upper()
+    try:
+        if method == "POST":
+            resp = session.post(auth_url, data=payload, timeout=timeout, allow_redirects=True)
+        else:
+            resp = session.get(auth_url, params=payload, timeout=timeout, allow_redirects=True)
+    except requests.RequestException:
+        print(f"{DIM}[auth]{RESET} Login request failed"); return False
+
+    ok = (resp.status_code < 400)
+    if success_regex:
+        try:
+            ok = ok and (re.search(success_regex, resp.text, re.IGNORECASE) is not None)
+        except re.error as e:
+            print(f"{DIM}[auth]{RESET} invalid success regex: {e}")
+    print(f"{PURPLE}[*]{RESET} Form auth {'OK' if ok else 'FAILED'} (HTTP {resp.status_code})")
+    return ok
+
+# ---------- Crawl ----------
 def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
                     max_depth, max_pages, visited, matched, parent_map, json_records):
-    stack = deque([(root_url, 0, None)])  # (url, depth, parent)
+    stack = deque([(root_url, 0, None)])
     total_fetched = 0
 
     while stack:
         url, depth, parent = stack.pop()
-        if url in visited:
-            continue
+        if url in visited: continue
         if total_fetched >= max_pages:
-            print(f"{DIM}[limit] max-pages reached{RESET}")
-            break
+            print(f"{DIM}[limit] max-pages reached{RESET}"); break
 
         visited.add(url)
-        if parent and url not in parent_map:
-            parent_map[url] = parent
+        if parent and url not in parent_map: parent_map[url] = parent
 
         txt = fetch_text(session, url, timeout)
         total_fetched += 1
@@ -129,14 +232,8 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
 
         if matcher(txt):
             matched.add(url)
-            ch = chain_for(url, parent_map)
             print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
-            json_records.append({
-                "url": url,
-                "depth": depth,
-                "parent": parent,
-                "chain": ch
-            })
+            json_records.append({"url": url, "depth": depth, "parent": parent, "chain": chain_for(url, parent_map)})
 
             if depth < max_depth:
                 for link in extract_links(url, txt, allow_offdomain=allow_offdomain):
@@ -144,31 +241,62 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
                         stack.append((link, depth+1, url))
         else:
             print(f"{'  '*depth}[.... ] {url}")
-            # do not expand children; branch ends
-
         time.sleep(delay + random.uniform(0, 0.8))
 
+# ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser(description="", formatter_class=BannerHelp)
-    parser.add_argument("url_list", help="Path to file with URLs (.onion or clearnet), one per line")
-    parser.add_argument("phrase", help="Word or phrase to search for (literal by default)")
-    parser.add_argument("-o", "--out", default="matches.txt", help="Output file for matching URLs (default: matches.txt)")
-    parser.add_argument("--json", action="store_true", help="Also write a JSON report with depth and parent chain")
-    parser.add_argument("--json-out", default="matches.json", help="Path for JSON report (default: matches.json)")
-    parser.add_argument("--regex", action="store_true", help="Treat PHRASE as a case-insensitive regex")
-    parser.add_argument("--socks-host", default="127.0.0.1", help="Tor SOCKS host (default: 127.0.0.1)")
-    parser.add_argument("--socks-port", type=int, default=9050, help="Tor SOCKS port (default: 9050)")
-    parser.add_argument("--timeout", type=int, default=25, help="Per-request timeout seconds (default: 25)")
-    parser.add_argument("--delay", type=float, default=1.2, help="Base delay between requests (default: 1.2s)")
-    parser.add_argument("--max-depth", type=int, default=3, help="Maximum recursion depth along matching branches")
-    parser.add_argument("--max-pages", type=int, default=200, help="Safety cap on total fetched pages")
-    parser.add_argument("--offdomain", action="store_true",
-                        help="Allow following links to other domains/hidden services (default: same host only)")
+    class BannerHelp(argparse.RawTextHelpFormatter):
+        def add_usage(self, usage, actions, groups, prefix=None):
+            prefix = (f"{ASCII_BANNER}\n{DESCRIPTION}\n\n" if prefix is None else prefix)
+            return super().add_usage(usage, actions, groups, prefix=prefix)
+
+    p = argparse.ArgumentParser(description="", formatter_class=BannerHelp)
+
+    # Core
+    p.add_argument("url_list", help="Path to file with URLs (.onion or clearnet), one per line")
+    p.add_argument("phrase", help="Word or regex pattern to search for (case-insensitive)")
+    p.add_argument("-o","--out", default="matches.txt", help="Output file for matching URLs (default: matches.txt)")
+    p.add_argument("--json", action="store_true", help="Also write a JSON report")
+    p.add_argument("--json-out", default="matches.json", help="Path for JSON report (default: matches.json)")
+    p.add_argument("--regex", action="store_true", help="Treat PHRASE as a regex (otherwise literal)")
+
+    # Crawl limits
+    p.add_argument("--max-depth", type=int, default=3, help="Max recursion depth along matching branches")
+    p.add_argument("--max-pages", type=int, default=200, help="Safety cap on total fetched pages")
+    p.add_argument("--delay", type=float, default=1.2, help="Base delay between requests")
+    p.add_argument("--offdomain", action="store_true", help="Allow following links to other domains/hidden services")
+
+    # Tor & HTTP
+    p.add_argument("--socks-host", default="127.0.0.1", help="Tor SOCKS host")
+    p.add_argument("--socks-port", type=int, default=9050, help="Tor SOCKS port")
+    p.add_argument("--timeout", type=int, default=25, help="Per-request timeout seconds")
+
+    # Auth
+    p.add_argument("--auth-mode", choices=["none","basic","form","bearer"], default="none",
+                   help="Authentication mode (default: none)")
+    p.add_argument("--auth-url", help="Login URL (required for form auth)")
+    p.add_argument("--auth-method", choices=["GET","POST"], default="POST", help="Form auth HTTP method")
+    p.add_argument("--username", help="Username for basic/form auth")
+    p.add_argument("--password", help="Password for basic/form auth")
+    p.add_argument("--user-field", default="username", help="Form field name for username")
+    p.add_argument("--pass-field", default="password", help="Form field name for password")
+    p.add_argument("--field", action="append", help="Extra form field k=v (repeatable)")
+    p.add_argument("--csrf-selector", help="CSS selector to capture CSRF token from login page")
+    p.add_argument("--csrf-attr", default="value", help="Attribute name for CSRF token (e.g., value|content|text)")
+    p.add_argument("--success-regex", help="Regex that must appear in the response after login")
+    p.add_argument("--bearer-token", help="Bearer token string")
+    p.add_argument("--bearer-token-file", help="Path to file containing bearer token")
+    p.add_argument("--cookie-jar", help="(Optional) Path to persist cookies between runs")
+    # new args
+    p.add_argument("--verbose", action="store_true", help="Print HTTP status and content-type for each fetch")
+    p.add_argument("--no-verify", action="store_true", help="Disable TLS verification (debug only)")
+    p.add_argument("--save-debug", action="store_true", help="Save fetched HTML to debug_pages/ for inspection")
+
 
     if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
-        parser.print_help(); sys.exit(0)
+        p.print_help(); sys.exit(0)
 
-    args = parser.parse_args()
+    args = p.parse_args()
     print(ASCII_BANNER)
 
     urls = load_urls(args.url_list)
@@ -176,12 +304,38 @@ def main():
         print("No URLs loaded.", file=sys.stderr); sys.exit(1)
 
     session = make_session(args.socks_host, args.socks_port)
-    matcher = build_matcher(args.phrase, args.regex)
 
+    # Auth flow (global, before crawl)
+    if args.auth_mode != "none":
+        if args.auth_mode == "basic":
+            if not (args.username and args.password):
+                print(f"{DIM}[auth]{RESET} basic requires --username & --password"); sys.exit(2)
+            do_basic_auth(session, args.username, args.password)
+
+        elif args.auth_mode == "bearer":
+            do_bearer_auth(session, args.bearer_token, args.bearer_token_file)
+
+        elif args.auth_mode == "form":
+            extras = parse_kv_pairs(args.field)
+            ok = do_form_auth(session=session,
+                              auth_url=args.auth_url,
+                              method=args.auth_method,
+                              username=args.username,
+                              password=args.password,
+                              user_field=args.user_field,
+                              pass_field=args.pass_field,
+                              extra_fields=extras,
+                              csrf_selector=args.csrf-selector if hasattr(args, "csrf-selector") else args.csrf_selector,
+                              csrf_attr=args.csrf_attr,
+                              timeout=args.timeout,
+                              success_regex=args.success_regex)
+            if not ok:
+                print(f"{DIM}[auth]{RESET} form auth failed (continuing without guaranteed session)")
+
+    matcher = build_matcher(args.phrase, args.regex)
     out_path = pathlib.Path(args.out)
     visited, matched = set(), set()
-    parent_map = {}          # child -> parent
-    json_records = []        # appended per match
+    parent_map, json_records = {}, []
 
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
