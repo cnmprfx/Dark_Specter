@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-# Dark Spectre - Tor Keyword Hunter (Recursive + Regex + JSON + Auth + Render + Screenshots)
-# Requires: requests[socks], beautifulsoup4
-# Optional (for --render / --shots): playwright + `playwright install firefox`
+# Dark Spectre - Tor Keyword Hunter
+# Features: Recursive follow-if-match + Regex/Literal + JSON + Auth (basic/form/bearer)
+#           Verbose/Debug + Optional Headless Rendering (Playwright) + Screenshots (de-duped per URL)
+# Deps:    pip install requests[socks] beautifulsoup4
+# Optional (for --render/--shots):
+#          pip install playwright && playwright install firefox
 
 import argparse, sys, time, random, pathlib, re, json, os
 import requests
@@ -23,10 +26,10 @@ ASCII_BANNER = rf"""
 
 DESCRIPTION = f"""{RED}Dark Spectre{RESET} hunts for keywords/regex on darknet & clearnet URLs via Tor.
 It recurses ONLY along links where the match keeps reappearing. Supports:
-- Regex matching, JSON reports (with depth & chains)
+- Regex or literal matching, JSON reports (with depth & chains)
 - Auth (basic / form with CSRF / bearer)
 - Verbose & debug HTML dumps
-- Optional headless rendering + screenshots
+- Optional headless rendering + screenshots (de-duped per URL)
 """
 
 # ===== Helpers =====
@@ -41,7 +44,7 @@ def make_session(socks_host="127.0.0.1", socks_port=9050, ua=None):
         "https": f"socks5h://{socks_host}:{socks_port}",
     }
     s.headers.update({
-        "User-Agent": ua or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.4"
+        "User-Agent": ua or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.5"
     })
     return s
 
@@ -185,7 +188,6 @@ def do_form_auth(session, auth_url, method, username, password,
     if csrf_selector:
         token = get_csrf_value(r.text, csrf_selector, csrf_attr or "value")
         if token is not None:
-            # Try infer field name if input[name=...]
             try:
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(r.text, "html.parser")
@@ -221,13 +223,10 @@ class Renderer:
             from playwright.sync_api import sync_playwright
         except ImportError:
             raise RuntimeError("Playwright not installed. Run: pip install playwright && playwright install firefox")
-        self._sync_playwright = __import__("playwright").sync_api.sync_playwright().start()
-        self._browser = self._sync_playwright.firefox.launch(
-            headless=headless,
-            proxy={"server": proxy_server}
-        )
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.firefox.launch(headless=headless, proxy={"server": proxy_server})
         self._context = self._browser.new_context(
-            user_agent=user_agent or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.4"
+            user_agent=user_agent or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.5"
         )
         self.wait_until = wait_until
         self.timeout_ms = timeout_ms
@@ -245,7 +244,7 @@ class Renderer:
         try:
             self._context.close()
             self._browser.close()
-            self._sync_playwright.stop()
+            self._pw.stop()
         except Exception:
             pass
 
@@ -262,7 +261,11 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
                     max_depth, max_pages, visited, matched, parent_map, json_records,
                     *, verify_tls=True, verbose=False, save_debug=False,
                     renderer=None, shots=False, shots_dir="screenshots",
-                    shot_mode="matches", render_for_match=False):
+                    shot_mode="matches", render_for_match=False,
+                    shot_taken=None):
+    if shot_taken is None:
+        shot_taken = set()
+
     stack = deque([(root_url, 0, None)])
     total_fetched = 0
 
@@ -277,25 +280,43 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
         if parent and url not in parent_map:
             parent_map[url] = parent
 
+        # 1) Fetch raw HTML via requests (fast, cheap)
         txt = fetch_text(session, url, timeout,
                          verify_tls=verify_tls,
                          verbose=verbose,
                          save_debug=save_debug)
         total_fetched += 1
 
-        # If using renderer for match (JS-heavy), grab rendered HTML; optionally screenshot ALL pages
+        # 2) If rendering is requested for matching, render now (optionally screenshot ALL pages)
         if renderer and render_for_match:
             try:
                 ss_path = None
-                if shots and shot_mode == "all":
+                if shots and shot_mode == "all" and (url not in shot_taken):
                     os.makedirs(shots_dir, exist_ok=True)
                     ss_path = os.path.join(shots_dir, _safe_name(url, depth))
                 txt = renderer.render(url, screenshot_path=ss_path)
-                if verbose:
-                    print(f"[render] {url} -> {'shot' if ss_path else 'no-shot'}")
+                if ss_path:
+                    shot_taken.add(url)
+                    if verbose:
+                        print(f"[shot] saved {ss_path}")
+                elif verbose:
+                    print(f"[render] {url} -> no-shot")
             except Exception as e:
                 if verbose:
                     print(f"[render] EXC {type(e).__name__}: {e} {url}")
+
+        # 3) If not rendering for match but we still want ALL screenshots, grab shot now (without replacing txt)
+        elif renderer and shots and shot_mode == "all" and (url not in shot_taken):
+            try:
+                os.makedirs(shots_dir, exist_ok=True)
+                ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                renderer.render(url, screenshot_path=ss_path)  # ignore returned HTML
+                shot_taken.add(url)
+                if verbose:
+                    print(f"[shot] saved {ss_path}")
+            except Exception as e:
+                if verbose:
+                    print(f"[shot] EXC {type(e).__name__}: {e} {url}")
 
         if not txt:
             print(f"{DIM}[fail]{RESET} {url}")
@@ -310,20 +331,19 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
             })
 
             # Screenshot on match (if not already shot in ALL mode)
-            if shots and shot_mode == "matches":
-                if renderer:
-                    try:
-                        os.makedirs(shots_dir, exist_ok=True)
-                        ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                        renderer.render(url, screenshot_path=ss_path)  # render for shot
-                        if verbose:
-                            print(f"[shot] saved {ss_path}")
-                    except Exception as e:
-                        if verbose:
-                            print(f"[shot] EXC {type(e).__name__}: {e} {url}")
-                else:
+            if shots and (shot_mode == "matches") and renderer and (url not in shot_taken):
+                try:
+                    os.makedirs(shots_dir, exist_ok=True)
+                    ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                    renderer.render(url, screenshot_path=ss_path)
+                    shot_taken.add(url)
                     if verbose:
-                        print("[shot] --shots requested but --render not enabled; enable --render to capture screenshots.")
+                        print(f"[shot] saved {ss_path}")
+                except Exception as e:
+                    if verbose:
+                        print(f"[shot] EXC {type(e).__name__}: {e} {url}")
+            elif shots and (shot_mode == "matches") and not renderer and verbose:
+                print("[shot] --shots requested but --render not enabled; enable --render to capture screenshots.")
 
             if depth < max_depth:
                 for link in extract_links(url, txt, allow_offdomain=allow_offdomain):
@@ -331,6 +351,7 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
                         stack.append((link, depth+1, url))
         else:
             print(f"{'  '*depth}[STOP ] {url}")
+
         time.sleep(delay + random.uniform(0, 0.8))
 
 # ===== Main =====
@@ -446,7 +467,7 @@ def main():
             proxy = f"socks5://{args.socks_host}:{args.socks_port}"
             renderer = Renderer(
                 proxy_server=proxy,
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.4",
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.5",
                 headless=True,
                 wait_until=args.render_wait,
                 timeout_ms=args.render_timeout
@@ -461,6 +482,7 @@ def main():
     out_path = pathlib.Path(args.out)
     visited, matched = set(), set()
     parent_map, json_records = {}, []
+    shot_taken = set()  # <-- global de-dupe across entire run
 
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
@@ -484,7 +506,8 @@ def main():
             shots=args.shots,
             shots_dir=args.shots_dir,
             shot_mode=args.shot_mode,
-            render_for_match=render_for_match
+            render_for_match=render_for_match,
+            shot_taken=shot_taken,   # pass the global set
         )
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
