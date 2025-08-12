@@ -66,22 +66,20 @@ def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug
             allow_redirects=True,
             verify=verify_tls,
             headers={
-                # a bit more “browsery”:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate",  # requests handles decompression
+                "Accept-Encoding": "gzip, deflate",
             },
         )
         ct = r.headers.get("Content-Type", "")
         if verbose:
             print(f"[http] {r.status_code} {ct} {url}")
 
-        # keep body for 2xx and 3xx — many challenge/redirect pages still contain readable text
+        html = None
         if 200 <= r.status_code < 400 and ("text" in ct or ct == "" or url.endswith(".onion")):
             html = r.text[:2_000_000]
-        else:
-            # For debugging, still capture body (may contain block/challenge text)
-            html = r.text[:2_000_000] if ("text" in ct) else None
+        elif "text" in ct:
+            html = r.text[:2_000_000]
 
         if save_debug and html:
             os.makedirs("debug_pages", exist_ok=True)
@@ -210,43 +208,44 @@ def do_form_auth(session, auth_url, method, username, password,
 
 # ---------- Crawl ----------
 def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
-                    max_depth, max_pages, visited, matched, parent_map, json_records):
+                    max_depth, max_pages, visited, matched, parent_map, json_records,
+                    *, verify_tls=True, verbose=False, save_debug=False):
     stack = deque([(root_url, 0, None)])
     total_fetched = 0
 
     while stack:
         url, depth, parent = stack.pop()
-        if url in visited: continue
+        if url in visited:
+            continue
         if total_fetched >= max_pages:
-            print(f"{DIM}[limit] max-pages reached{RESET}"); break
+            print(f"\x1b[2m[limit]\x1b[0m max-pages reached"); break
 
         visited.add(url)
-        if parent and url not in parent_map: parent_map[url] = parent
+        if parent and url not in parent_map:
+            parent_map[url] = parent
 
-        txt = fetch_text(
-    session, url, timeout,
-    verify_tls=not args.no_verify,
-    verbose=args.verbose,
-    save_debug=args.save_debug
-)
-
+        txt = fetch_text(session, url, timeout,
+                         verify_tls=verify_tls,
+                         verbose=verbose,
+                         save_debug=save_debug)
         total_fetched += 1
 
         if not txt:
-            print(f"{DIM}[fail]{RESET} {url}")
+            print(f"\x1b[2m[fail]\x1b[0m {url}")
             continue
 
         if matcher(txt):
             matched.add(url)
-            print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
-            json_records.append({"url": url, "depth": depth, "parent": parent, "chain": chain_for(url, parent_map)})
+            print(f"\x1b[91m{'  '*depth}[MATCH]\x1b[0m {url}")
+            json_records.append({"url": url, "depth": depth, "parent": parent,
+                                 "chain": chain_for(url, parent_map)})
 
             if depth < max_depth:
                 for link in extract_links(url, txt, allow_offdomain=allow_offdomain):
                     if link not in visited:
                         stack.append((link, depth+1, url))
         else:
-            print(f"{'  '*depth}[.... ] {url}")
+            print(f"{'  '*depth}[STOP ] {url}")   # clearer than [.... ]
         time.sleep(delay + random.uniform(0, 0.8))
 
 # ---------- Main ----------
@@ -345,18 +344,24 @@ def main():
 
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
-        crawl_recursive(session=session,
-                        root_url=seed,
-                        matcher=matcher,
-                        timeout=args.timeout,
-                        delay=args.delay,
-                        allow_offdomain=args.offdomain,
-                        max_depth=args.max_depth,
-                        max_pages=args.max_pages,
-                        visited=visited,
-                        matched=matched,
-                        parent_map=parent_map,
-                        json_records=json_records)
+        crawl_recursive(
+            session=session,
+            root_url=seed,
+            matcher=matcher,
+            timeout=args.timeout,
+            delay=args.delay,
+            allow_offdomain=args.offdomain,
+            max_depth=args.max_depth,
+            max_pages=args.max_pages,
+            visited=visited,
+            matched=matched,
+            parent_map=parent_map,
+            json_records=json_records,
+            verify_tls=not args.no_verify,
+            verbose=args.verbose,
+            save_debug=args.save_debug,
+        )
+
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
     if args.json:
