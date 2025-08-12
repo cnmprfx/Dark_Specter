@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-# Dark Spectre - Tor Keyword Hunter (Recursive + Regex + JSON + Auth)
-import argparse, requests, sys, time, random, pathlib, re, json, os
+# Dark Spectre - Tor Keyword Hunter (Recursive + Regex + JSON + Auth + Render + Screenshots)
+# Requires: requests[socks], beautifulsoup4
+# Optional (for --render / --shots): playwright + `playwright install firefox`
+
+import argparse, sys, time, random, pathlib, re, json, os
+import requests
 from urllib.parse import urljoin, urlparse
 from collections import deque
 
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    print("Missing dependency: beautifulsoup4\nInstall with: pip install beautifulsoup4", file=sys.stderr)
-    sys.exit(1)
-
-# ANSI Colors
+# ===== ANSI Colors =====
 RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
 
 ASCII_BANNER = rf"""
@@ -24,33 +22,31 @@ ASCII_BANNER = rf"""
 """
 
 DESCRIPTION = f"""{RED}Dark Spectre{RESET} hunts for keywords/regex on darknet & clearnet URLs via Tor.
-It recurses ONLY along links where the match keeps re-appearing.
-Now adds optional authentication: form login (with CSRF), Basic, or Bearer tokens.
+It recurses ONLY along links where the match keeps reappearing. Supports:
+- Regex matching, JSON reports (with depth & chains)
+- Auth (basic / form with CSRF / bearer)
+- Verbose & debug HTML dumps
+- Optional headless rendering + screenshots
 """
 
-# ---------- Core helpers ----------
+# ===== Helpers =====
 def load_urls(path):
     with open(path, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
-def make_session(socks_host="127.0.0.1", socks_port=9050, ua=None, cookie_jar=None):
+def make_session(socks_host="127.0.0.1", socks_port=9050, ua=None):
     s = requests.Session()
-    s.proxies = {"http": f"socks5h://{socks_host}:{socks_port}",
-                 "https": f"socks5h://{socks_host}:{socks_port}"}
-    s.headers.update({"User-Agent": ua or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.3"})
-    if cookie_jar:
-        try:
-            s.cookies = requests.cookies.cookiejar_from_dict({})
-            s.cookies.set_policy(None)
-            s.cookies = requests.cookies.RequestsCookieJar()
-            # Basic file-based jar compatibility
-            s.cookies.jar = None
-        except Exception:
-            pass
+    s.proxies = {
+        "http":  f"socks5h://{socks_host}:{socks_port}",
+        "https": f"socks5h://{socks_host}:{socks_port}",
+    }
+    s.headers.update({
+        "User-Agent": ua or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.4"
+    })
     return s
 
 def is_http_like(url):
-    scheme = urlparse(url).scheme.lower()
+    scheme = (urlparse(url).scheme or "").lower()
     return scheme in ("http", "https", "")
 
 def same_domain(u1, u2):
@@ -94,11 +90,17 @@ def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug
         return None
 
 def extract_links(base_url, html, allow_offdomain=False):
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("Missing dependency: beautifulsoup4\nInstall with: pip install beautifulsoup4", file=sys.stderr)
+        sys.exit(1)
+
     links = set()
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
-        href = a.get("href").strip()
-        if href.startswith("#") or href.lower().startswith("javascript:"):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
         abs_url = urljoin(base_url, href)
         if not is_http_like(abs_url):
@@ -116,7 +118,7 @@ def build_matcher(phrase, use_regex):
             print(f"Invalid regex: {e}", file=sys.stderr); sys.exit(2)
     else:
         rx = re.compile(re.escape(phrase), re.IGNORECASE)
-    return lambda text: (rx.search(text) is not None)
+    return lambda text: (text is not None) and (rx.search(text) is not None)
 
 def chain_for(url, parent_map):
     chain, cur, seen = [], url, set()
@@ -125,7 +127,7 @@ def chain_for(url, parent_map):
     chain.reverse()
     return chain
 
-# ---------- Authentication ----------
+# ===== Auth helpers =====
 def parse_kv_pairs(pairs):
     out = {}
     for p in pairs or []:
@@ -139,13 +141,18 @@ def parse_kv_pairs(pairs):
 def get_csrf_value(html, selector, attr):
     if not selector:
         return None
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("Missing dependency: beautifulsoup4\nInstall with: pip install beautifulsoup4", file=sys.stderr)
+        sys.exit(1)
     soup = BeautifulSoup(html, "html.parser")
     el = soup.select_one(selector)
     if not el:
         return None
-    if attr.lower() == "text":
+    if (attr or "").lower() == "text":
         return el.get_text(strip=True)
-    return el.get(attr, None)
+    return el.get(attr or "value", None)
 
 def do_basic_auth(session, username, password):
     session.auth = (username, password)
@@ -178,17 +185,17 @@ def do_form_auth(session, auth_url, method, username, password,
     if csrf_selector:
         token = get_csrf_value(r.text, csrf_selector, csrf_attr or "value")
         if token is not None:
-            # Try to infer field name from selector if it's an <input name=...>
-            soup = BeautifulSoup(r.text, "html.parser")
-            el = soup.select_one(csrf_selector)
-            name = el.get("name") if el else None
-            if name:
-                payload[name] = token
-            else:
-                # generic key
-                payload["_csrf"] = token
+            # Try infer field name if input[name=...]
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(r.text, "html.parser")
+                el = soup.select_one(csrf_selector)
+                name = el.get("name") if el else None
+            except Exception:
+                name = None
+            payload[name or "_csrf"] = token
 
-    method = method.upper()
+    method = (method or "POST").upper()
     try:
         if method == "POST":
             resp = session.post(auth_url, data=payload, timeout=timeout, allow_redirects=True)
@@ -206,10 +213,56 @@ def do_form_auth(session, auth_url, method, username, password,
     print(f"{PURPLE}[*]{RESET} Form auth {'OK' if ok else 'FAILED'} (HTTP {resp.status_code})")
     return ok
 
-# ---------- Crawl ----------
+# ===== Optional headless renderer (Playwright) =====
+class Renderer:
+    def __init__(self, proxy_server, user_agent=None, headless=True,
+                 wait_until="networkidle", timeout_ms=30000):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise RuntimeError("Playwright not installed. Run: pip install playwright && playwright install firefox")
+        self._sync_playwright = __import__("playwright").sync_api.sync_playwright().start()
+        self._browser = self._sync_playwright.firefox.launch(
+            headless=headless,
+            proxy={"server": proxy_server}
+        )
+        self._context = self._browser.new_context(
+            user_agent=user_agent or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.4"
+        )
+        self.wait_until = wait_until
+        self.timeout_ms = timeout_ms
+
+    def render(self, url, screenshot_path=None, full_page=True):
+        page = self._context.new_page()
+        page.goto(url, wait_until=self.wait_until, timeout=self.timeout_ms)
+        if screenshot_path:
+            page.screenshot(path=screenshot_path, full_page=full_page)
+        html = page.content()
+        page.close()
+        return html
+
+    def close(self):
+        try:
+            self._context.close()
+            self._browser.close()
+            self._sync_playwright.stop()
+        except Exception:
+            pass
+
+# ===== Filename helper for screenshots =====
+import re as _re, time as _time
+def _safe_name(url, depth):
+    base = url.replace("://","_").replace("/", "_")
+    base = _re.sub(r"[^A-Za-z0-9_.-]", "_", base)
+    ts = _time.strftime("%Y%m%d-%H%M%S")
+    return f"d{depth}_{ts}_{base[:120]}.png"
+
+# ===== Crawl =====
 def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
                     max_depth, max_pages, visited, matched, parent_map, json_records,
-                    *, verify_tls=True, verbose=False, save_debug=False):
+                    *, verify_tls=True, verbose=False, save_debug=False,
+                    renderer=None, shots=False, shots_dir="screenshots",
+                    shot_mode="matches", render_for_match=False):
     stack = deque([(root_url, 0, None)])
     total_fetched = 0
 
@@ -218,7 +271,7 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
         if url in visited:
             continue
         if total_fetched >= max_pages:
-            print(f"\x1b[2m[limit]\x1b[0m max-pages reached"); break
+            print(f"{DIM}[limit]{RESET} max-pages reached"); break
 
         visited.add(url)
         if parent and url not in parent_map:
@@ -230,25 +283,57 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
                          save_debug=save_debug)
         total_fetched += 1
 
+        # If using renderer for match (JS-heavy), grab rendered HTML; optionally screenshot ALL pages
+        if renderer and render_for_match:
+            try:
+                ss_path = None
+                if shots and shot_mode == "all":
+                    os.makedirs(shots_dir, exist_ok=True)
+                    ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                txt = renderer.render(url, screenshot_path=ss_path)
+                if verbose:
+                    print(f"[render] {url} -> {'shot' if ss_path else 'no-shot'}")
+            except Exception as e:
+                if verbose:
+                    print(f"[render] EXC {type(e).__name__}: {e} {url}")
+
         if not txt:
-            print(f"\x1b[2m[fail]\x1b[0m {url}")
+            print(f"{DIM}[fail]{RESET} {url}")
             continue
 
         if matcher(txt):
             matched.add(url)
-            print(f"\x1b[91m{'  '*depth}[MATCH]\x1b[0m {url}")
-            json_records.append({"url": url, "depth": depth, "parent": parent,
-                                 "chain": chain_for(url, parent_map)})
+            print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
+            json_records.append({
+                "url": url, "depth": depth, "parent": parent,
+                "chain": chain_for(url, parent_map)
+            })
+
+            # Screenshot on match (if not already shot in ALL mode)
+            if shots and shot_mode == "matches":
+                if renderer:
+                    try:
+                        os.makedirs(shots_dir, exist_ok=True)
+                        ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                        renderer.render(url, screenshot_path=ss_path)  # render for shot
+                        if verbose:
+                            print(f"[shot] saved {ss_path}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"[shot] EXC {type(e).__name__}: {e} {url}")
+                else:
+                    if verbose:
+                        print("[shot] --shots requested but --render not enabled; enable --render to capture screenshots.")
 
             if depth < max_depth:
                 for link in extract_links(url, txt, allow_offdomain=allow_offdomain):
                     if link not in visited:
                         stack.append((link, depth+1, url))
         else:
-            print(f"{'  '*depth}[STOP ] {url}")   # clearer than [.... ]
+            print(f"{'  '*depth}[STOP ] {url}")
         time.sleep(delay + random.uniform(0, 0.8))
 
-# ---------- Main ----------
+# ===== Main =====
 def main():
     class BannerHelp(argparse.RawTextHelpFormatter):
         def add_usage(self, usage, actions, groups, prefix=None):
@@ -274,7 +359,12 @@ def main():
     # Tor & HTTP
     p.add_argument("--socks-host", default="127.0.0.1", help="Tor SOCKS host")
     p.add_argument("--socks-port", type=int, default=9050, help="Tor SOCKS port")
-    p.add_argument("--timeout", type=int, default=25, help="Per-request timeout seconds")
+    p.add_argument("--timeout", type=int, default=45, help="Per-request timeout seconds")
+
+    # Verbose / TLS / Debug
+    p.add_argument("--verbose", action="store_true", help="Print HTTP status and content-type for each fetch")
+    p.add_argument("--no-verify", action="store_true", help="Disable TLS verification (debug only)")
+    p.add_argument("--save-debug", action="store_true", help="Save fetched HTML to debug_pages/ for inspection")
 
     # Auth
     p.add_argument("--auth-mode", choices=["none","basic","form","bearer"], default="none",
@@ -291,13 +381,22 @@ def main():
     p.add_argument("--success-regex", help="Regex that must appear in the response after login")
     p.add_argument("--bearer-token", help="Bearer token string")
     p.add_argument("--bearer-token-file", help="Path to file containing bearer token")
-    p.add_argument("--cookie-jar", help="(Optional) Path to persist cookies between runs")
-    # new args
-    p.add_argument("--verbose", action="store_true", help="Print HTTP status and content-type for each fetch")
-    p.add_argument("--no-verify", action="store_true", help="Disable TLS verification (debug only)")
-    p.add_argument("--save-debug", action="store_true", help="Save fetched HTML to debug_pages/ for inspection")
 
+    # Screenshots & Rendering
+    p.add_argument("--shots", action="store_true",
+                   help="Take screenshots (saved to --shots-dir). Default mode captures only matched pages.")
+    p.add_argument("--shots-dir", default="screenshots",
+                   help="Directory to store screenshots (default: screenshots)")
+    p.add_argument("--shot-mode", choices=["matches","all"], default="matches",
+                   help="Screenshot only matched pages or all visited pages (default: matches)")
+    p.add_argument("--render", action="store_true",
+                   help="Use a headless browser for JS rendering (Playwright via Tor proxy)")
+    p.add_argument("--render-timeout", type=int, default=30000,
+                   help="Render timeout in ms for page navigation (default: 30000)")
+    p.add_argument("--render-wait", choices=["load","domcontentloaded","networkidle"], default="networkidle",
+                   help="Playwright wait_until condition (default: networkidle)")
 
+    # Help banner handling
     if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
         p.print_help(); sys.exit(0)
 
@@ -310,7 +409,7 @@ def main():
 
     session = make_session(args.socks_host, args.socks_port)
 
-    # Auth flow (global, before crawl)
+    # Auth (global)
     if args.auth_mode != "none":
         if args.auth_mode == "basic":
             if not (args.username and args.password):
@@ -330,14 +429,35 @@ def main():
                               user_field=args.user_field,
                               pass_field=args.pass_field,
                               extra_fields=extras,
-                              csrf_selector=args.csrf-selector if hasattr(args, "csrf-selector") else args.csrf_selector,
+                              csrf_selector=args.csrf_selector,
                               csrf_attr=args.csrf_attr,
                               timeout=args.timeout,
                               success_regex=args.success_regex)
             if not ok:
                 print(f"{DIM}[auth]{RESET} form auth failed (continuing without guaranteed session)")
 
+    # Build matcher
     matcher = build_matcher(args.phrase, args.regex)
+
+    # Optional renderer
+    renderer = None
+    try:
+        if args.render or args.shots:
+            proxy = f"socks5://{args.socks_host}:{args.socks_port}"
+            renderer = Renderer(
+                proxy_server=proxy,
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.4",
+                headless=True,
+                wait_until=args.render_wait,
+                timeout_ms=args.render_timeout
+            )
+    except RuntimeError as e:
+        print(f"[render] {e}")
+        if args.render or args.shots:
+            print("[render] Rendering disabled (continuing without renderer).")
+
+    render_for_match = args.render  # use rendered HTML for matching only when --render is given
+
     out_path = pathlib.Path(args.out)
     visited, matched = set(), set()
     parent_map, json_records = {}, []
@@ -360,8 +480,12 @@ def main():
             verify_tls=not args.no_verify,
             verbose=args.verbose,
             save_debug=args.save_debug,
+            renderer=renderer,
+            shots=args.shots,
+            shots_dir=args.shots_dir,
+            shot_mode=args.shot_mode,
+            render_for_match=render_for_match
         )
-
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
     if args.json:
@@ -372,6 +496,9 @@ def main():
                 "total_matches": len(matched),
                 "matches": json_records
             }, jf, indent=2, ensure_ascii=False)
+
+    if renderer:
+        renderer.close()
 
     print(f"\nDone. {len(matched)} matches → {out_path}"
           + (f"  |  JSON → {args.json_out}" if args.json else ""))
