@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Dark Spectre - Tor Keyword Hunter
-# Features: Recursive follow-if-match + Regex/Literal + JSON + Auth (basic/form/bearer)
+# Now spiders entire apps (default) + per-URL/host session profiles (--session-map)
+# Features: Regex/Literal + JSON + Auth (basic/form/bearer global or per-profile)
 #           Verbose/Debug + Optional Headless Rendering (Playwright) + Screenshots (de-duped per URL)
 # Deps:    pip install requests[socks] beautifulsoup4
 # Optional (for --render/--shots):
@@ -25,11 +26,8 @@ ASCII_BANNER = rf"""
 """
 
 DESCRIPTION = f"""{RED}Dark Spectre{RESET} hunts for keywords/regex on darknet & clearnet URLs via Tor.
-It recurses ONLY along links where the match keeps reappearing. Supports:
-- Regex or literal matching, JSON reports (with depth & chains)
-- Auth (basic / form with CSRF / bearer)
-- Verbose & debug HTML dumps
-- Optional headless rendering + screenshots (de-duped per URL)
+It now spiders entire apps by default (keeps crawling even when a page doesn't match).
+Supports: regex matching, JSON reports, global or per-URL auth, verbose/debug, rendering & screenshots.
 """
 
 # ===== Helpers =====
@@ -37,15 +35,11 @@ def load_urls(path):
     with open(path, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
-def make_session(socks_host="127.0.0.1", socks_port=9050, ua=None):
+def make_base_session(socks_host="127.0.0.1", socks_port=9050, ua=None):
     s = requests.Session()
-    s.proxies = {
-        "http":  f"socks5h://{socks_host}:{socks_port}",
-        "https": f"socks5h://{socks_host}:{socks_port}",
-    }
-    s.headers.update({
-        "User-Agent": ua or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.5"
-    })
+    s.proxies = {"http": f"socks5h://{socks_host}:{socks_port}",
+                 "https": f"socks5h://{socks_host}:{socks_port}"}
+    s.headers.update({"User-Agent": ua or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.6"})
     return s
 
 def is_http_like(url):
@@ -130,15 +124,15 @@ def chain_for(url, parent_map):
     chain.reverse()
     return chain
 
-# ===== Auth helpers =====
+# ===== Auth & Session helpers =====
 def parse_kv_pairs(pairs):
     out = {}
     for p in pairs or []:
         if "=" not in p:
             print(f"{DIM}[auth] ignoring field (not k=v):{RESET} {p}")
             continue
-        k,v = p.split("=",1)
-        out[k]=v
+        k, v = p.split("=", 1)
+        out[k] = v
     return out
 
 def get_csrf_value(html, selector, attr):
@@ -215,6 +209,112 @@ def do_form_auth(session, auth_url, method, username, password,
     print(f"{PURPLE}[*]{RESET} Form auth {'OK' if ok else 'FAILED'} (HTTP {resp.status_code})")
     return ok
 
+# ---- Per-URL/host session map ----
+def load_session_map(path):
+    """
+    JSON format: list of profiles like:
+    [
+      {
+        "match": "example.onion",         # value to match
+        "kind": "host",                   # host | prefix | regex  (default host)
+        "auth": {                         # optional auth block
+          "mode": "basic|bearer|form",
+          "auth_url": "http://.../login", # for form
+          "method": "POST",
+          "username": "u", "password": "p",
+          "user_field": "username", "pass_field": "password",
+          "csrf_selector": "input[name=csrf_token]", "csrf_attr": "value",
+          "success_regex": "dashboard|logout",
+          "bearer_token": "xyz", "bearer_token_file": "token.txt"
+        },
+        "headers": { "X-API-Key": "abc" },# optional extra headers
+        "cookies": { "sid": "..." }       # optional cookies
+      }
+    ]
+    """
+    if not path:
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError("session-map must be a JSON list of profiles")
+    return data
+
+def profile_matches(url, prof):
+    kind = (prof.get("kind") or "host").lower()
+    target = prof.get("match") or ""
+    if not target:
+        return False
+    if kind == "host":
+        return (urlparse(url).hostname or "").lower() == target.lower()
+    if kind == "prefix":
+        return url.lower().startswith(target.lower())
+    if kind == "regex":
+        try:
+            return re.search(target, url, re.IGNORECASE) is not None
+        except re.error:
+            return False
+    return False
+
+def make_session_from_profile(base_session, prof, socks_host, socks_port, timeout):
+    s = requests.Session()
+    # copy Tor proxies
+    s.proxies = {"http": f"socks5h://{socks_host}:{socks_port}",
+                 "https": f"socks5h://{socks_host}:{socks_port}"}
+    # start with base headers
+    s.headers.update(base_session.headers.copy())
+    # add extra headers/cookies
+    if prof.get("headers"):
+        s.headers.update(dict(prof["headers"]))
+    if prof.get("cookies"):
+        for k, v in prof["cookies"].items():
+            s.cookies.set(k, v)
+
+    # auth block
+    auth = prof.get("auth") or {}
+    mode = (auth.get("mode") or "none").lower()
+    if mode == "basic":
+        do_basic_auth(s, auth.get("username"), auth.get("password"))
+    elif mode == "bearer":
+        do_bearer_auth(s, auth.get("bearer_token"), auth.get("bearer_token_file"))
+    elif mode == "form":
+        do_form_auth(
+            session=s,
+            auth_url=auth.get("auth_url"),
+            method=auth.get("method") or "POST",
+            username=auth.get("username"),
+            password=auth.get("password"),
+            user_field=auth.get("user_field") or "username",
+            pass_field=auth.get("pass_field") or "password",
+            extra_fields=None,  # if needed, could add auth["fields"]
+            csrf_selector=auth.get("csrf_selector"),
+            csrf_attr=auth.get("csrf_attr") or "value",
+            timeout=timeout,
+            success_regex=auth.get("success_regex"),
+        )
+    return s
+
+class SessionRouter:
+    """Chooses a requests.Session based on URL, using session-map profiles."""
+    def __init__(self, base_session, profiles, socks_host, socks_port, timeout, verbose=False):
+        self.base = base_session
+        self.profiles = profiles or []
+        self.cache = {}  # prof_idx -> Session
+        self.socks_host = socks_host; self.socks_port = socks_port
+        self.timeout = timeout; self.verbose = verbose
+
+    def session_for(self, url):
+        for idx, prof in enumerate(self.profiles):
+            if profile_matches(url, prof):
+                if idx not in self.cache:
+                    if self.verbose:
+                        print(f"[sess] create profile session {idx} for {prof.get('match')}")
+                    self.cache[idx] = make_session_from_profile(
+                        self.base, prof, self.socks_host, self.socks_port, self.timeout
+                    )
+                return self.cache[idx]
+        return self.base
+
 # ===== Optional headless renderer (Playwright) =====
 class Renderer:
     def __init__(self, proxy_server, user_agent=None, headless=True,
@@ -226,7 +326,7 @@ class Renderer:
         self._pw = sync_playwright().start()
         self._browser = self._pw.firefox.launch(headless=headless, proxy={"server": proxy_server})
         self._context = self._browser.new_context(
-            user_agent=user_agent or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.5"
+            user_agent=user_agent or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.6"
         )
         self.wait_until = wait_until
         self.timeout_ms = timeout_ms
@@ -257,12 +357,12 @@ def _safe_name(url, depth):
     return f"d{depth}_{ts}_{base[:120]}.png"
 
 # ===== Crawl =====
-def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
+def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_offdomain,
                     max_depth, max_pages, visited, matched, parent_map, json_records,
                     *, verify_tls=True, verbose=False, save_debug=False,
                     renderer=None, shots=False, shots_dir="screenshots",
                     shot_mode="matches", render_for_match=False,
-                    shot_taken=None):
+                    shot_taken=None, follow_only_if_match=False):
     if shot_taken is None:
         shot_taken = set()
 
@@ -279,6 +379,9 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
         visited.add(url)
         if parent and url not in parent_map:
             parent_map[url] = parent
+
+        # pick session based on URL/profile
+        session = session_router.session_for(url)
 
         # 1) Fetch raw HTML via requests (fast, cheap)
         txt = fetch_text(session, url, timeout,
@@ -305,7 +408,7 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
                 if verbose:
                     print(f"[render] EXC {type(e).__name__}: {e} {url}")
 
-        # 3) If not rendering for match but we still want ALL screenshots, grab shot now (without replacing txt)
+        # 3) If not rendering for match but we still want ALL screenshots, grab shot now
         elif renderer and shots and shot_mode == "all" and (url not in shot_taken):
             try:
                 os.makedirs(shots_dir, exist_ok=True)
@@ -322,14 +425,14 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
             print(f"{DIM}[fail]{RESET} {url}")
             continue
 
-        if matcher(txt):
+        is_match = matcher(txt)
+        if is_match:
             matched.add(url)
             print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
             json_records.append({
                 "url": url, "depth": depth, "parent": parent,
                 "chain": chain_for(url, parent_map)
             })
-
             # Screenshot on match (if not already shot in ALL mode)
             if shots and (shot_mode == "matches") and renderer and (url not in shot_taken):
                 try:
@@ -344,13 +447,17 @@ def crawl_recursive(session, root_url, matcher, timeout, delay, allow_offdomain,
                         print(f"[shot] EXC {type(e).__name__}: {e} {url}")
             elif shots and (shot_mode == "matches") and not renderer and verbose:
                 print("[shot] --shots requested but --render not enabled; enable --render to capture screenshots.")
-
-            if depth < max_depth:
-                for link in extract_links(url, txt, allow_offdomain=allow_offdomain):
-                    if link not in visited:
-                        stack.append((link, depth+1, url))
         else:
-            print(f"{'  '*depth}[STOP ] {url}")
+            print(f"{'  '*depth}[.... ] {url}")
+
+        # === Branching rule ===
+        # New default: spider entire app (always enqueue children, within depth/page limits)
+        # Old behavior preserved via --follow-only-if-match
+        should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
+        if should_expand:
+            for link in extract_links(url, txt, allow_offdomain=allow_offdomain):
+                if link not in visited:
+                    stack.append((link, depth+1, url))
 
         time.sleep(delay + random.uniform(0, 0.8))
 
@@ -371,25 +478,27 @@ def main():
     p.add_argument("--json-out", default="matches.json", help="Path for JSON report (default: matches.json)")
     p.add_argument("--regex", action="store_true", help="Treat PHRASE as a regex (otherwise literal)")
 
-    # Crawl limits
-    p.add_argument("--max-depth", type=int, default=3, help="Max recursion depth along matching branches")
-    p.add_argument("--max-pages", type=int, default=200, help="Safety cap on total fetched pages")
-    p.add_argument("--delay", type=float, default=1.2, help="Base delay between requests")
+    # Crawl limits / behavior
+    p.add_argument("--max-depth", type=int, default=3, help="Max recursion depth (default: 3)")
+    p.add_argument("--max-pages", type=int, default=400, help="Safety cap on total fetched pages (default: 400)")
+    p.add_argument("--delay", type=float, default=1.2, help="Base delay between requests (default: 1.2)")
     p.add_argument("--offdomain", action="store_true", help="Allow following links to other domains/hidden services")
+    p.add_argument("--follow-only-if-match", action="store_true",
+                   help="Use legacy behavior: only follow links when the current page matches")
 
     # Tor & HTTP
     p.add_argument("--socks-host", default="127.0.0.1", help="Tor SOCKS host")
     p.add_argument("--socks-port", type=int, default=9050, help="Tor SOCKS port")
-    p.add_argument("--timeout", type=int, default=45, help="Per-request timeout seconds")
+    p.add_argument("--timeout", type=int, default=60, help="Per-request timeout seconds (default: 60)")
 
     # Verbose / TLS / Debug
     p.add_argument("--verbose", action="store_true", help="Print HTTP status and content-type for each fetch")
     p.add_argument("--no-verify", action="store_true", help="Disable TLS verification (debug only)")
     p.add_argument("--save-debug", action="store_true", help="Save fetched HTML to debug_pages/ for inspection")
 
-    # Auth
+    # Global Auth (fallback)
     p.add_argument("--auth-mode", choices=["none","basic","form","bearer"], default="none",
-                   help="Authentication mode (default: none)")
+                   help="Global authentication mode (default: none)")
     p.add_argument("--auth-url", help="Login URL (required for form auth)")
     p.add_argument("--auth-method", choices=["GET","POST"], default="POST", help="Form auth HTTP method")
     p.add_argument("--username", help="Username for basic/form auth")
@@ -402,6 +511,9 @@ def main():
     p.add_argument("--success-regex", help="Regex that must appear in the response after login")
     p.add_argument("--bearer-token", help="Bearer token string")
     p.add_argument("--bearer-token-file", help="Path to file containing bearer token")
+
+    # Per-URL/host Session Map
+    p.add_argument("--session-map", help="Path to JSON file with per-URL/host session profiles")
 
     # Screenshots & Rendering
     p.add_argument("--shots", action="store_true",
@@ -428,21 +540,20 @@ def main():
     if not urls:
         print("No URLs loaded.", file=sys.stderr); sys.exit(1)
 
-    session = make_session(args.socks_host, args.socks_port)
+    # Base session (Tor)
+    base_session = make_base_session(args.socks_host, args.socks_port)
 
-    # Auth (global)
+    # Global auth (fallback) applies to base session if provided
     if args.auth_mode != "none":
         if args.auth_mode == "basic":
             if not (args.username and args.password):
                 print(f"{DIM}[auth]{RESET} basic requires --username & --password"); sys.exit(2)
-            do_basic_auth(session, args.username, args.password)
-
+            do_basic_auth(base_session, args.username, args.password)
         elif args.auth_mode == "bearer":
-            do_bearer_auth(session, args.bearer_token, args.bearer_token_file)
-
+            do_bearer_auth(base_session, args.bearer_token, args.bearer_token_file)
         elif args.auth_mode == "form":
             extras = parse_kv_pairs(args.field)
-            ok = do_form_auth(session=session,
+            ok = do_form_auth(session=base_session,
                               auth_url=args.auth_url,
                               method=args.auth_method,
                               username=args.username,
@@ -457,17 +568,20 @@ def main():
             if not ok:
                 print(f"{DIM}[auth]{RESET} form auth failed (continuing without guaranteed session)")
 
-    # Build matcher
+    # Load per-URL/host session profiles and router
+    profiles = load_session_map(args.session_map) if args.session_map else []
+    session_router = SessionRouter(base_session, profiles, args.socks_host, args.socks_port, args.timeout, verbose=args.verbose)
+
+    # Build matcher & renderer
     matcher = build_matcher(args.phrase, args.regex)
 
-    # Optional renderer
     renderer = None
     try:
         if args.render or args.shots:
             proxy = f"socks5://{args.socks_host}:{args.socks_port}"
             renderer = Renderer(
                 proxy_server=proxy,
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.5",
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.6",
                 headless=True,
                 wait_until=args.render_wait,
                 timeout_ms=args.render_timeout
@@ -482,12 +596,12 @@ def main():
     out_path = pathlib.Path(args.out)
     visited, matched = set(), set()
     parent_map, json_records = {}, []
-    shot_taken = set()  # <-- global de-dupe across entire run
+    shot_taken = set()  # global de-dupe across entire run
 
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
         crawl_recursive(
-            session=session,
+            session_router=session_router,
             root_url=seed,
             matcher=matcher,
             timeout=args.timeout,
@@ -507,7 +621,8 @@ def main():
             shots_dir=args.shots_dir,
             shot_mode=args.shot_mode,
             render_for_match=render_for_match,
-            shot_taken=shot_taken,   # pass the global set
+            shot_taken=shot_taken,
+            follow_only_if_match=args.follow_only_if_match,
         )
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
