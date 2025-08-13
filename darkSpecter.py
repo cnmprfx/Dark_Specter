@@ -507,9 +507,41 @@ def _safe_name(url, depth):
     ts = _time.strftime("%Y%m%d-%H%M%S")
     return f"d{depth}_{ts}_{base[:120]}.png"
 
-# ===== Crawl =====
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
+
+# ===== Crawl & Stats =====
+# (Global counters used by workers and stats thread)
+INFLIGHT = 0
+INFLIGHT_LOCK = threading.Lock()
+MAX_DEPTH_SEEN = 0
+MAX_DEPTH_LOCK = threading.Lock()
+
+def stats_loop(q, visited, matched, stop_event, interval=2.0):
+    start = time.time()
+    last_visited = 0
+    last_t = start
+    while not stop_event.is_set():
+        try:
+            qsize = q.qsize()
+        except Exception:
+            qsize = 0
+        with INFLIGHT_LOCK:
+            inflight = max(INFLIGHT, 0)
+        with MAX_DEPTH_LOCK:
+            depth_seen = MAX_DEPTH_SEEN
+        now = time.time()
+        dv = len(visited) - last_visited
+        dt = max(now - last_t, 1e-6)
+        rate = dv / dt
+        elapsed = int(now - start)
+        print(f"[stats] visited={len(visited)} queued={qsize} inflight={inflight} "
+              f"matched={len(matched)} depth={depth_seen} rate={rate:.2f}/s elapsed={elapsed}s",
+              end="\r", flush=True)
+        last_visited = len(visited)
+        last_t = now
+        stop_event.wait(interval)
+    # final newline so the next print doesn't overwrite the status line
+    print()
+
 
 def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, json_records,
                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
@@ -530,6 +562,10 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             with INFLIGHT_LOCK:
                 global INFLIGHT
                 INFLIGHT += 1
+            with MAX_DEPTH_LOCK:
+                global MAX_DEPTH_SEEN
+                if depth > MAX_DEPTH_SEEN:
+                    MAX_DEPTH_SEEN = depth
 
             # de-dupe / mark visited early
             with VISITED_LOCK:
@@ -655,15 +691,13 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
     queue = Queue()
     queue.put((root_url, 0, None))
 
-    stats = CrawlStats()
-    stop_evt = threading.Event()
-    limiter = PageLimiter(max_pages)
+   # start live stats thread
+    stop_stats = threading.Event()
     stats_thread = None
-    # Use carriage-return single line only when crawl_log is off (to avoid mixing)
-    if stats_interval and stats_interval > 0:
+    if True:  # always on; you can gate this with a CLI flag if desired
         stats_thread = threading.Thread(
-            target=_stats_printer,
-            args=(queue, stats, stop_evt, float(stats_interval), not crawl_log),
+            target=stats_loop,
+            args=(queue, visited, matched, stop_stats, getattr(sys.modules[__name__], "STATS_INTERVAL", 2.0)),
             daemon=True,
         )
         stats_thread.start()
@@ -678,6 +712,10 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                 limiter, stop_evt
             )
         queue.join()
+        # stop stats
+    if stats_thread:
+        stop_stats.set()
+        stats_thread.join(timeout=1)
         # Stop stats thread
     if stats_interval and stats_interval > 0:
         stop_evt.set()
@@ -770,6 +808,9 @@ def main():
         p.print_help(); sys.exit(0)
 
     args = p.parse_args()
+    # make stats interval available to stats_loop
+    global STATS_INTERVAL
+    STATS_INTERVAL = args.stats_interval
     print(ASCII_BANNER)
 
     urls = load_urls(args.url_list)
