@@ -18,7 +18,7 @@ ASCII_BANNER = rf"""
 {RED}  ____             _        {PURPLE}____                  _
 {RED} |  _ \  __ _ _ __| | __   {PURPLE}/ ___| _ __   ___  ___| |_ ___ _ __
 {RED} | | | |/ _` | '__| |/ /   {PURPLE}\___ \| '_ \ / _ \/ __| __/ _ \ '__|
-{RED} | |_| | (_| | |  |   <     {PURPLE}___) | |_) |  __/ (__| ||  __/ |
+{RED} | |_| | (_| | |  |   <     {PURPLE}___) | |_) |  __/ (__| ||  __| |
 {RED} |____/ \__,_|_|  |_|\_\   {PURPLE}|____/| .__/ \___|\___|\__\___|_|
 {PURPLE}                                 |_|
 {RESET}                ==== {RED}Dark {PURPLE}Spectre{RESET} - Tor Keyword Hunter ====
@@ -189,18 +189,15 @@ class CrawlStats:
         self.matched = 0
         self.max_depth = 0
         self.fetched = 0
-
     def on_fetch(self, depth):
         with self.lock:
             self.visited += 1
             self.fetched += 1
             if depth > self.max_depth:
                 self.max_depth = depth
-
     def on_match(self):
         with self.lock:
             self.matched += 1
-
     def snapshot(self):
         with self.lock:
             return {
@@ -461,12 +458,12 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                  stats: CrawlStats, limiter: "PageLimiter", stop_evt: threading.Event):
 
     shot_taken = set()
+    shots_dir = shots_dir or "screenshots"
 
     while not stop_evt.is_set():
         try:
             url, depth, parent = queue.get(timeout=1)
         except Empty:
-            # no work right now; spin again until stop or new work appears
             continue
 
         with INFLIGHT_LOCK:
@@ -477,7 +474,6 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             # de-dupe visited early
             with VISITED_LOCK:
                 if url in visited:
-                    queue.task_done()
                     continue
                 visited.add(url)
 
@@ -491,7 +487,6 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
 
             # max-pages limiter
             if not limiter.allow_fetch():
-                queue.task_done()
                 continue
 
             # pick session based on URL/profile
@@ -507,14 +502,13 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             if not txt:
                 if crawl_log:
                     print(f"{DIM}[fail]{RESET} {url}")
-                queue.task_done()
                 continue
 
             # renderer + optional screenshots (ALL mode)
             if renderer and shots and shot_mode == "all" and (url not in shot_taken):
                 try:
-                    os.makedirs(shots_dir or "screenshots", exist_ok=True)
-                    ss_path = os.path.join(shots_dir or "screenshots", _safe_name(url, depth))
+                    os.makedirs(shots_dir, exist_ok=True)
+                    ss_path = os.path.join(shots_dir, _safe_name(url, depth))
                     renderer.render(url, screenshot_path=ss_path)
                     shot_taken.add(url)
                     if verbose:
@@ -537,8 +531,8 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                 # screenshot on match (matches mode)
                 if shots and shot_mode == "matches" and renderer and (url not in shot_taken):
                     try:
-                        os.makedirs(shots_dir or "screenshots", exist_ok=True)
-                        ss_path = os.path.join(shots_dir or "screenshots", _safe_name(url, depth))
+                        os.makedirs(shots_dir, exist_ok=True)
+                        ss_path = os.path.join(shots_dir, _safe_name(url, depth))
                         renderer.render(url, screenshot_path=ss_path)
                         shot_taken.add(url)
                         if verbose:
@@ -580,10 +574,8 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             print(f"[worker ERROR] {type(e).__name__}: {e}")
             traceback.print_exc()
         finally:
-            try:
-                queue.task_done()
-            except Exception:
-                pass
+            # exactly one task_done per get()
+            queue.task_done()
             with INFLIGHT_LOCK:
                 INFLIGHT -= 1
 
@@ -600,7 +592,8 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
     stats = CrawlStats()
     stop_evt = threading.Event()
     limiter = PageLimiter(max_pages)
-    stats_thread = None
+
+    # live stats thread (CR line if crawl_log is off)
     if stats_interval and stats_interval > 0:
         stats_thread = threading.Thread(
             target=_stats_printer,
@@ -608,6 +601,8 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
             daemon=True,
         )
         stats_thread.start()
+    else:
+        stats_thread = None
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for _ in range(max_workers):
@@ -618,12 +613,14 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                 crawl_log, delay, timeout, verify_tls, verbose, save_debug,
                 stats, limiter, stop_evt
             )
+        # Wait for all tasks to complete
         q.join()
-
-    if stats_interval and stats_interval > 0:
+        # IMPORTANT: signal workers to stop BEFORE leaving the executor context
         stop_evt.set()
-        if stats_thread:
-            stats_thread.join(timeout=1.0)
+
+    # stop stats thread after workers signaled
+    if stats_thread:
+        stats_thread.join(timeout=1.0)
 
 # ===== Main =====
 def main():
@@ -644,11 +641,11 @@ def main():
 
     # Crawl limits / behavior
     p.add_argument("--max-depth", type=int, default=3, help="Max recursion depth (default: 3)")
-    p.add_argument("--max-pages", type=int, default=400, help="Safety cap on total fetched pages (0 = unlimited)")
+    p.add_argument("--max-pages", type=int, default=400, help="Safety cap on total fetched pages (default: 400)")
     p.add_argument("--delay", type=float, default=1.2, help="Base delay between requests (default: 1.2)")
     p.add_argument("--offdomain", action="store_true", help="Allow following links to other domains/hidden services")
     p.add_argument("--follow-only-if-match", action="store_true",
-                   help="Only follow links when the current page matches (legacy behavior)")
+                   help="Use legacy behavior: only follow links when the current page matches")
 
     # Tor & HTTP
     p.add_argument("--socks-host", default="127.0.0.1", help="Tor SOCKS host")
@@ -681,7 +678,7 @@ def main():
 
     # Screenshots & Rendering
     p.add_argument("--shots", action="store_true",
-                   help="Take screenshots (saved to --shots-dir). Default captures only matched pages.")
+                   help="Take screenshots (saved to --shots-dir). Default mode captures only matched pages.")
     p.add_argument("--shots-dir", default="screenshots",
                    help="Directory to store screenshots (default: screenshots)")
     p.add_argument("--shot-mode", choices=["matches","all"], default="matches",
@@ -693,17 +690,19 @@ def main():
     p.add_argument("--render-wait", choices=["load","domcontentloaded","networkidle"], default="networkidle",
                    help="Playwright wait_until condition (default: networkidle)")
 
-    # Crawl scope & diagnostics
+    # Logs & scope
     p.add_argument("--crawl-log", action="store_true",
-                   help="Show each page fetch and enqueue in real-time (verbose queue log)")
+               help="Show each page fetch and enqueue in real-time")
     p.add_argument("--allow-subdomains", action="store_true",
-                   help="Treat subdomains (incl. www) as same site when --offdomain is not set")
+               help="Treat subdomains (incl. www) as same site when --offdomain is not set")
     p.add_argument("--exclude-domains", nargs="+", default=[],
-                   help="Domains/regex to skip (e.g., '.*bitcoin.*' badsite.onion)")
+               help="Space-separated list of domains to skip (regex supported, e.g., '.*bitcoin.*' badsite.onion)")
+
+    # Concurrency & stats
     p.add_argument("--max-workers", type=int, default=5,
-                   help="Max concurrent fetches (workers) to run in parallel")
+               help="Max concurrent fetches (workers) to run in parallel")
     p.add_argument("--stats-interval", type=float, default=2.0,
-                   help="Seconds between live stats updates (0 to disable)")
+               help="Seconds between live stats updates (0 to disable)")
 
     # Help banner handling
     if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
@@ -719,7 +718,7 @@ def main():
     # Base session (Tor)
     base_session = make_base_session(args.socks_host, args.socks_port)
 
-    # Global auth (fallback)
+    # Global auth (fallback) applies to base session if provided
     if args.auth_mode != "none":
         if args.auth_mode == "basic":
             if not (args.username and args.password):
@@ -744,10 +743,11 @@ def main():
             if not ok:
                 print(f"{DIM}[auth]{RESET} form auth failed (continuing without guaranteed session)")
 
-    # Per-URL/host session profiles
+    # Load per-URL/host session profiles and router
     profiles = load_session_map(args.session_map) if args.session_map else []
     session_router = SessionRouter(base_session, profiles, args.socks_host, args.socks_port, args.timeout, verbose=args.verbose)
 
+    # Build matcher & renderer
     matcher = build_matcher(args.phrase, args.regex)
 
     renderer = None
@@ -765,6 +765,7 @@ def main():
         print(f"[render] {e}")
         if args.render or args.shots:
             print("[render] Rendering disabled (continuing without renderer).")
+        renderer = None
 
     out_path = pathlib.Path(args.out)
     visited, matched = set(), set()
