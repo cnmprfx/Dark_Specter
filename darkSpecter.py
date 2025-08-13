@@ -1,45 +1,40 @@
 #!/usr/bin/env python3
 # Dark Spectre - Tor Keyword Hunter
-# Now spiders entire apps (default) + per-URL/host session profiles (--session-map)
-# Features: Regex/Literal + JSON + Auth (basic/form/bearer global or per-profile)
-#           Verbose/Debug + Optional Headless Rendering (Playwright) + Screenshots (de-duped per URL)
-# Deps:    pip install requests[socks] beautifulsoup4
-# Optional (for --render/--shots):
-#          pip install playwright && playwright install firefox
+# Spiders entire apps (default) + per-URL/host session profiles (--session-map)
+# Regex/Literal match + JSON + Auth (basic/form/bearer global or per-profile)
+# Verbose/Debug + Optional Headless Rendering (Playwright) + Screenshots
+# Concurrency with live stats + max-pages limiter
 
-import argparse, sys, time, random, pathlib,json, os
+import argparse, sys, time, random, pathlib, json, os, re, threading, traceback
 import requests
 from urllib.parse import urljoin, urlparse
-from collections import deque
-import re as re
 from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
-import threading, traceback
-
-# light global-ish counters for stats
-INFLIGHT = 0
-INFLIGHT_LOCK = threading.Lock()
-VISITED_LOCK = threading.Lock()
-MATCHED_LOCK = threading.Lock()
-PARENT_LOCK = threading.Lock()
+from queue import Queue, Empty
 
 # ===== ANSI Colors =====
 RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
 
 ASCII_BANNER = rf"""
-{RED}  ____             _        {PURPLE}____                  _            
-{RED} |  _ \  __ _ _ __| | __   {PURPLE}/ ___| _ __   ___  ___| |_ ___ _ __ 
+{RED}  ____             _        {PURPLE}____                  _
+{RED} |  _ \  __ _ _ __| | __   {PURPLE}/ ___| _ __   ___  ___| |_ ___ _ __
 {RED} | | | |/ _` | '__| |/ /   {PURPLE}\___ \| '_ \ / _ \/ __| __/ _ \ '__|
-{RED} | |_| | (_| | |  |   <     {PURPLE}___) | |_) |  __/ (__| ||  __/ |   
-{RED} |____/ \__,_|_|  |_|\_\   {PURPLE}|____/| .__/ \___|\___|\__\___|_|   
-{PURPLE}                                 |_|                           
+{RED} | |_| | (_| | |  |   <     {PURPLE}___) | |_) |  __/ (__| ||  __/ |
+{RED} |____/ \__,_|_|  |_|\_\   {PURPLE}|____/| .__/ \___|\___|\__\___|_|
+{PURPLE}                                 |_|
 {RESET}                ==== {RED}Dark {PURPLE}Spectre{RESET} - Tor Keyword Hunter ====
 """
 
 DESCRIPTION = f"""{RED}Dark Spectre{RESET} hunts for keywords/regex on darknet & clearnet URLs via Tor.
-It now spiders entire apps by default (keeps crawling even when a page doesn't match).
-Supports: regex matching, JSON reports, global or per-URL auth, verbose/debug, rendering & screenshots.
+Spiders entire apps by default. Supports regex matching, JSON reports, per-URL auth,
+verbose/debug, optional rendering & screenshots, and concurrent crawling with live stats.
 """
+
+# ---- global counters/locks for worker bookkeeping ----
+INFLIGHT = 0
+INFLIGHT_LOCK = threading.Lock()
+VISITED_LOCK = threading.Lock()
+MATCHED_LOCK = threading.Lock()
+PARENT_LOCK = threading.Lock()
 
 # ===== Helpers =====
 def load_urls(path):
@@ -58,7 +53,6 @@ def is_http_like(url):
     return scheme in ("http", "https", "")
 
 def compile_exclude_patterns(patterns):
-    """Compile exclude patterns into regex objects."""
     compiled = []
     for pat in patterns:
         pat = pat.strip()
@@ -67,17 +61,16 @@ def compile_exclude_patterns(patterns):
         try:
             compiled.append(re.compile(pat, re.IGNORECASE))
         except re.error as e:
-            print(f"[warn] Invalid regex in exclude-domains: {pat} ({e})", file=sys.stderr)
+            print(f"[warn] Invalid regex in --exclude-domains: {pat} ({e})", file=sys.stderr)
     return compiled
 
 def is_excluded(url, compiled_patterns):
-    """Return True if hostname matches any compiled exclude regex."""
     host = (urlparse(url).hostname or "").lower()
     if not host:
         return False
     return any(p.search(host) for p in compiled_patterns)
 
-# --- Host helpers (drop-in replacement) ---
+# --- Host helpers ---
 def _host(h: str) -> str:
     return (h or "").lower().strip()
 
@@ -86,14 +79,9 @@ def _strip_www(h: str) -> str:
     return h[4:] if h.startswith("www.") else h
 
 def same_domain(u1, u2):
-    """Strict host equality (foo.example.com == foo.example.com)."""
     return _host(urlparse(u1).hostname) == _host(urlparse(u2).hostname)
 
 def same_site(u1, u2):
-    """
-    Consider subdomains the same 'site':
-    www.example.com ~ example.com, blog.example.com ~ example.com, etc.
-    """
     h1 = _strip_www(urlparse(u1).hostname)
     h2 = _strip_www(urlparse(u2).hostname)
     if not h1 or not h2:
@@ -137,8 +125,7 @@ def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug
 
 PLAIN_URL_RE = re.compile(r'\bhttps?://[^\s"\'<>)]+', re.IGNORECASE)
 def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False, exclude_patterns=None):
-    if exclude_patterns is None:
-        exclude_patterns = []
+    exclude_patterns = exclude_patterns or []
     try:
         from bs4 import BeautifulSoup
     except ImportError:
@@ -148,30 +135,25 @@ def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False,
     links = set()
     soup = BeautifulSoup(html or "", "html.parser")
 
-    # 1) Anchors
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
         links.add(urljoin(base_url, href))
 
-    # 2) Image map <area>
     for ar in soup.find_all("area", href=True):
         href = (ar.get("href") or "").strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
         links.add(urljoin(base_url, href))
 
-    # 3) Plain-text URLs
     for m in PLAIN_URL_RE.finditer(html or ""):
         links.add(m.group(0))
 
-    # Scope filtering
     filtered = set()
     for abs_url in links:
         if not is_http_like(abs_url):
             continue
-        # Skip excluded domains
         if is_excluded(abs_url, exclude_patterns):
             continue
         if allow_offdomain:
@@ -180,7 +162,6 @@ def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False,
             if same_domain(base_url, abs_url) or (allow_subdomains and same_site(base_url, abs_url)):
                 filtered.add(abs_url)
     return list(filtered)
-
 
 def build_matcher(phrase, use_regex):
     if use_regex:
@@ -231,25 +212,22 @@ class CrawlStats:
             }
 
 def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval: float, use_cr: bool):
-    # Print a single line periodically with carriage-return (unless crawl_log is on)
     while not stop_evt.is_set():
         snap = stats.snapshot()
-        qsize = 0
         try:
             qsize = queue.qsize()
         except Exception:
-            pass
+            qsize = 0
         rate = snap["fetched"] / snap["elapsed"]
         line = (f"[stats] visited={snap['visited']} queued={qsize} matched={snap['matched']} "
                 f"depth={snap['max_depth']} rate={rate:.2f}/s elapsed={int(snap['elapsed'])}s")
         if use_cr:
-            print("\r" + line + " " * 10, end="", flush=True)
+            print("\r" + line + " " * 12, end="", flush=True)
         else:
             print(line, flush=True)
         stop_evt.wait(interval)
-    # Final newline if we were using carriage returns
     if use_cr:
-        print("")
+        print()
 
 # ===== Page limiter (max-pages) =====
 class PageLimiter:
@@ -258,17 +236,14 @@ class PageLimiter:
         self.max_pages = int(max_pages)
         self._count = 0
         self._lock = threading.Lock()
-
     def allow_fetch(self) -> bool:
-        """Reserve one fetch slot if available; return True if allowed."""
         with self._lock:
             if self.max_pages <= 0:
-                return True  # unlimited
+                return True
             if self._count >= self.max_pages:
                 return False
             self._count += 1
             return True
-
     def remaining(self) -> int:
         with self._lock:
             if self.max_pages <= 0:
@@ -362,27 +337,6 @@ def do_form_auth(session, auth_url, method, username, password,
 
 # ---- Per-URL/host session map ----
 def load_session_map(path):
-    """
-    JSON format: list of profiles like:
-    [
-      {
-        "match": "example.onion",         # value to match
-        "kind": "host",                   # host | prefix | regex  (default host)
-        "auth": {                         # optional auth block
-          "mode": "basic|bearer|form",
-          "auth_url": "http://.../login", # for form
-          "method": "POST",
-          "username": "u", "password": "p",
-          "user_field": "username", "pass_field": "password",
-          "csrf_selector": "input[name=csrf_token]", "csrf_attr": "value",
-          "success_regex": "dashboard|logout",
-          "bearer_token": "xyz", "bearer_token_file": "token.txt"
-        },
-        "headers": { "X-API-Key": "abc" },# optional extra headers
-        "cookies": { "sid": "..." }       # optional cookies
-      }
-    ]
-    """
     if not path:
         return []
     with open(path, "r", encoding="utf-8") as f:
@@ -409,19 +363,15 @@ def profile_matches(url, prof):
 
 def make_session_from_profile(base_session, prof, socks_host, socks_port, timeout):
     s = requests.Session()
-    # copy Tor proxies
     s.proxies = {"http": f"socks5h://{socks_host}:{socks_port}",
                  "https": f"socks5h://{socks_host}:{socks_port}"}
-    # start with base headers
     s.headers.update(base_session.headers.copy())
-    # add extra headers/cookies
     if prof.get("headers"):
         s.headers.update(dict(prof["headers"]))
     if prof.get("cookies"):
         for k, v in prof["cookies"].items():
             s.cookies.set(k, v)
 
-    # auth block
     auth = prof.get("auth") or {}
     mode = (auth.get("mode") or "none").lower()
     if mode == "basic":
@@ -437,7 +387,7 @@ def make_session_from_profile(base_session, prof, socks_host, socks_port, timeou
             password=auth.get("password"),
             user_field=auth.get("user_field") or "username",
             pass_field=auth.get("pass_field") or "password",
-            extra_fields=None,  # if needed, could add auth["fields"]
+            extra_fields=None,
             csrf_selector=auth.get("csrf_selector"),
             csrf_attr=auth.get("csrf_attr") or "value",
             timeout=timeout,
@@ -446,14 +396,12 @@ def make_session_from_profile(base_session, prof, socks_host, socks_port, timeou
     return s
 
 class SessionRouter:
-    """Chooses a requests.Session based on URL, using session-map profiles."""
     def __init__(self, base_session, profiles, socks_host, socks_port, timeout, verbose=False):
         self.base = base_session
         self.profiles = profiles or []
-        self.cache = {}  # prof_idx -> Session
+        self.cache = {}
         self.socks_host = socks_host; self.socks_port = socks_port
         self.timeout = timeout; self.verbose = verbose
-
     def session_for(self, url):
         for idx, prof in enumerate(self.profiles):
             if profile_matches(url, prof):
@@ -481,7 +429,6 @@ class Renderer:
         )
         self.wait_until = wait_until
         self.timeout_ms = timeout_ms
-
     def render(self, url, screenshot_path=None, full_page=True):
         page = self._context.new_page()
         page.goto(url, wait_until=self.wait_until, timeout=self.timeout_ms)
@@ -490,7 +437,6 @@ class Renderer:
         html = page.content()
         page.close()
         return html
-
     def close(self):
         try:
             self._context.close()
@@ -507,79 +453,33 @@ def _safe_name(url, depth):
     ts = _time.strftime("%Y%m%d-%H%M%S")
     return f"d{depth}_{ts}_{base[:120]}.png"
 
-
-# ===== Crawl & Stats =====
-# (Global counters used by workers and stats thread)
-INFLIGHT = 0
-INFLIGHT_LOCK = threading.Lock()
-MAX_DEPTH_SEEN = 0
-MAX_DEPTH_LOCK = threading.Lock()
-
-def stats_loop(q, visited, matched, stop_event, interval=2.0):
-    start = time.time()
-    last_visited = 0
-    last_t = start
-    while not stop_event.is_set():
-        try:
-            qsize = q.qsize()
-        except Exception:
-            qsize = 0
-        with INFLIGHT_LOCK:
-            inflight = max(INFLIGHT, 0)
-        with MAX_DEPTH_LOCK:
-            depth_seen = MAX_DEPTH_SEEN
-        now = time.time()
-        dv = len(visited) - last_visited
-        dt = max(now - last_t, 1e-6)
-        rate = dv / dt
-        elapsed = int(now - start)
-        print(f"[stats] visited={len(visited)} queued={qsize} inflight={inflight} "
-              f"matched={len(matched)} depth={depth_seen} rate={rate:.2f}/s elapsed={elapsed}s",
-              end="\r", flush=True)
-        last_visited = len(visited)
-        last_t = now
-        stop_event.wait(interval)
-    # final newline so the next print doesn't overwrite the status line
-    print()
-
-
+# ===== Worker & Crawl =====
 def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, json_records,
-                max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
+                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                  follow_only_if_match, renderer, shots, shot_mode, shots_dir,
-                 crawl_log, delay, timeout, verify_tls, verbose, save_debug, stats: CrawlStats,
-                 limiter: "PageLimiter", stop_evt: threading.Event):
+                 crawl_log, delay, timeout, verify_tls, verbose, save_debug,
+                 stats: CrawlStats, limiter: "PageLimiter", stop_evt: threading.Event):
 
     shot_taken = set()
-    print("[worker] started")
 
-    while True:
-            
-            try:
-                url, depth, parent = queue.get(timeout=1)
-            except Exception:
-                return  # queue empty (for this worker)
+    while not stop_evt.is_set():
+        try:
+            url, depth, parent = queue.get(timeout=1)
+        except Empty:
+            # no work right now; spin again until stop or new work appears
+            continue
 
-            with INFLIGHT_LOCK:
-                global INFLIGHT
-                INFLIGHT += 1
-            with MAX_DEPTH_LOCK:
-                global MAX_DEPTH_SEEN
-                if depth > MAX_DEPTH_SEEN:
-                    MAX_DEPTH_SEEN = depth
+        with INFLIGHT_LOCK:
+            global INFLIGHT
+            INFLIGHT += 1
 
-            # de-dupe / mark visited early
+        try:
+            # de-dupe visited early
             with VISITED_LOCK:
                 if url in visited:
-                    return_to_done = True
-                else:
-                    visited.add(url)
-                    return_to_done = False
-
-            if return_to_done:
-                queue.task_done()
-                with INFLIGHT_LOCK:
-                    INFLIGHT -= 1
-                continue
+                    queue.task_done()
+                    continue
+                visited.add(url)
 
             if parent:
                 with PARENT_LOCK:
@@ -589,25 +489,32 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             if crawl_log:
                 print(f"{'  '*depth}[fetch] depth={depth} url={url}")
 
-            # Pick session based on URL/profile
+            # max-pages limiter
+            if not limiter.allow_fetch():
+                queue.task_done()
+                continue
+
+            # pick session based on URL/profile
             session = session_router.session_for(url)
 
-            # Fetch HTML
+            # fetch
             txt = fetch_text(session, url, timeout,
                              verify_tls=verify_tls,
                              verbose=verbose,
                              save_debug=save_debug)
+            stats.on_fetch(depth)
 
             if not txt:
                 if crawl_log:
                     print(f"{DIM}[fail]{RESET} {url}")
+                queue.task_done()
                 continue
 
-            # Renderer + optional screenshots (ALL mode)
+            # renderer + optional screenshots (ALL mode)
             if renderer and shots and shot_mode == "all" and (url not in shot_taken):
                 try:
-                    os.makedirs(shots_dir, exist_ok=True)
-                    ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                    os.makedirs(shots_dir or "screenshots", exist_ok=True)
+                    ss_path = os.path.join(shots_dir or "screenshots", _safe_name(url, depth))
                     renderer.render(url, screenshot_path=ss_path)
                     shot_taken.add(url)
                     if verbose:
@@ -616,21 +523,22 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                     if verbose:
                         print(f"[shot] EXC {type(e).__name__}: {e} {url}")
 
-            # Match check
+            # match check
             is_match = matcher(txt)
             if is_match:
                 with MATCHED_LOCK:
                     matched.add(url)
+                stats.on_match()
                 print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
                 json_records.append({
                     "url": url, "depth": depth, "parent": parent,
                     "chain": chain_for(url, parent_map)
                 })
-                # Screenshot on match (matches mode)
+                # screenshot on match (matches mode)
                 if shots and shot_mode == "matches" and renderer and (url not in shot_taken):
                     try:
-                        os.makedirs(shots_dir, exist_ok=True)
-                        ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                        os.makedirs(shots_dir or "screenshots", exist_ok=True)
+                        ss_path = os.path.join(shots_dir or "screenshots", _safe_name(url, depth))
                         renderer.render(url, screenshot_path=ss_path)
                         shot_taken.add(url)
                         if verbose:
@@ -641,7 +549,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             elif crawl_log:
                 print(f"{'  '*depth}[....] {url}")
 
-            # Spider children
+            # expand children
             should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
             if should_expand:
                 children = extract_links(
@@ -668,8 +576,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             if delay > 0:
                 time.sleep(delay + random.uniform(0, 0.8))
 
-         except Exception as e:
-            # Surface the real reason for a “stuck” crawl
+        except Exception as e:
             print(f"[worker ERROR] {type(e).__name__}: {e}")
             traceback.print_exc()
         finally:
@@ -680,7 +587,6 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             with INFLIGHT_LOCK:
                 INFLIGHT -= 1
 
-
 def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_map, json_records,
                     max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                     follow_only_if_match=False, renderer=None, shots=False, shot_mode="matches",
@@ -688,16 +594,17 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                     verbose=False, save_debug=False, max_workers=5, stats_interval=2.0,
                     max_pages=0):
 
-    queue = Queue()
-    queue.put((root_url, 0, None))
+    q = Queue()
+    q.put((root_url, 0, None))
 
-   # start live stats thread
-    stop_stats = threading.Event()
+    stats = CrawlStats()
+    stop_evt = threading.Event()
+    limiter = PageLimiter(max_pages)
     stats_thread = None
-    if True:  # always on; you can gate this with a CLI flag if desired
+    if stats_interval and stats_interval > 0:
         stats_thread = threading.Thread(
-            target=stats_loop,
-            args=(queue, visited, matched, stop_stats, getattr(sys.modules[__name__], "STATS_INTERVAL", 2.0)),
+            target=_stats_printer,
+            args=(q, stats, stop_evt, float(stats_interval), not crawl_log),
             daemon=True,
         )
         stats_thread.start()
@@ -705,18 +612,14 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for _ in range(max_workers):
             executor.submit(
-                crawl_worker, queue, session_router, matcher, matched, visited, parent_map, json_records,
+                crawl_worker, q, session_router, matcher, matched, visited, parent_map, json_records,
                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                 follow_only_if_match, renderer, shots, shot_mode, shots_dir,
-                crawl_log, delay, timeout, verify_tls, verbose, save_debug, stats,
-                limiter, stop_evt
+                crawl_log, delay, timeout, verify_tls, verbose, save_debug,
+                stats, limiter, stop_evt
             )
-        queue.join()
-        # stop stats
-    if stats_thread:
-        stop_stats.set()
-        stats_thread.join(timeout=1)
-        # Stop stats thread
+        q.join()
+
     if stats_interval and stats_interval > 0:
         stop_evt.set()
         if stats_thread:
@@ -741,11 +644,11 @@ def main():
 
     # Crawl limits / behavior
     p.add_argument("--max-depth", type=int, default=3, help="Max recursion depth (default: 3)")
-    p.add_argument("--max-pages", type=int, default=400, help="Safety cap on total fetched pages (default: 400)")
+    p.add_argument("--max-pages", type=int, default=400, help="Safety cap on total fetched pages (0 = unlimited)")
     p.add_argument("--delay", type=float, default=1.2, help="Base delay between requests (default: 1.2)")
     p.add_argument("--offdomain", action="store_true", help="Allow following links to other domains/hidden services")
     p.add_argument("--follow-only-if-match", action="store_true",
-                   help="Use legacy behavior: only follow links when the current page matches")
+                   help="Only follow links when the current page matches (legacy behavior)")
 
     # Tor & HTTP
     p.add_argument("--socks-host", default="127.0.0.1", help="Tor SOCKS host")
@@ -778,7 +681,7 @@ def main():
 
     # Screenshots & Rendering
     p.add_argument("--shots", action="store_true",
-                   help="Take screenshots (saved to --shots-dir). Default mode captures only matched pages.")
+                   help="Take screenshots (saved to --shots-dir). Default captures only matched pages.")
     p.add_argument("--shots-dir", default="screenshots",
                    help="Directory to store screenshots (default: screenshots)")
     p.add_argument("--shot-mode", choices=["matches","all"], default="matches",
@@ -789,28 +692,24 @@ def main():
                    help="Render timeout in ms for page navigation (default: 30000)")
     p.add_argument("--render-wait", choices=["load","domcontentloaded","networkidle"], default="networkidle",
                    help="Playwright wait_until condition (default: networkidle)")
+
+    # Crawl scope & diagnostics
     p.add_argument("--crawl-log", action="store_true",
-               help="Show each page fetch and enqueue in real-time")
+                   help="Show each page fetch and enqueue in real-time (verbose queue log)")
     p.add_argument("--allow-subdomains", action="store_true",
-               help="Treat subdomains (incl. www) as same site when --offdomain is not set")
+                   help="Treat subdomains (incl. www) as same site when --offdomain is not set")
     p.add_argument("--exclude-domains", nargs="+", default=[],
-               help="Space-separated list of domains to skip (supports regex, e.g., '.*bitcoin.*' badsite.onion)")
+                   help="Domains/regex to skip (e.g., '.*bitcoin.*' badsite.onion)")
     p.add_argument("--max-workers", type=int, default=5,
-               help="Max concurrent fetches (workers) to run in parallel")
+                   help="Max concurrent fetches (workers) to run in parallel")
     p.add_argument("--stats-interval", type=float, default=2.0,
-               help="Seconds between live stats updates (0 to disable)")
-
-
-
+                   help="Seconds between live stats updates (0 to disable)")
 
     # Help banner handling
     if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
         p.print_help(); sys.exit(0)
 
     args = p.parse_args()
-    # make stats interval available to stats_loop
-    global STATS_INTERVAL
-    STATS_INTERVAL = args.stats_interval
     print(ASCII_BANNER)
 
     urls = load_urls(args.url_list)
@@ -820,7 +719,7 @@ def main():
     # Base session (Tor)
     base_session = make_base_session(args.socks_host, args.socks_port)
 
-    # Global auth (fallback) applies to base session if provided
+    # Global auth (fallback)
     if args.auth_mode != "none":
         if args.auth_mode == "basic":
             if not (args.username and args.password):
@@ -845,11 +744,10 @@ def main():
             if not ok:
                 print(f"{DIM}[auth]{RESET} form auth failed (continuing without guaranteed session)")
 
-    # Load per-URL/host session profiles and router
+    # Per-URL/host session profiles
     profiles = load_session_map(args.session_map) if args.session_map else []
     session_router = SessionRouter(base_session, profiles, args.socks_host, args.socks_port, args.timeout, verbose=args.verbose)
 
-    # Build matcher & renderer
     matcher = build_matcher(args.phrase, args.regex)
 
     renderer = None
@@ -868,13 +766,11 @@ def main():
         if args.render or args.shots:
             print("[render] Rendering disabled (continuing without renderer).")
 
-    render_for_match = args.render  # use rendered HTML for matching only when --render is given
-
     out_path = pathlib.Path(args.out)
     visited, matched = set(), set()
     parent_map, json_records = {}, []
-    shot_taken = set()  # global de-dupe across entire run
     compiled_excludes = compile_exclude_patterns(args.exclude_domains)
+
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
         crawl_recursive(
@@ -903,9 +799,7 @@ def main():
             max_workers=args.max_workers,
             stats_interval=args.stats_interval,
             max_pages=args.max_pages
-            )
-
-
+        )
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
     if args.json:
