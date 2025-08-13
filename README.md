@@ -1,6 +1,6 @@
-Dark Spectre is a Tor-powered keyword hunter for darknet & clearnet URLs.
-It recursively follows links ONLY along branches where the keyword/phrase keeps re-appearing.
-Now supports regex searches and a JSON report with depth and parent chains.
+Dark Spectre hunts for keywords/regex on darknet & clearnet URLs via Tor.
+It now spiders entire apps by default (keeps crawling even when a page doesn't match).
+Supports: regex matching, JSON reports, global or per-URL auth, verbose/debug, rendering & screenshots.
 
 Dark Spectre — Tor Keyword Hunter Ops Cheat Sheet
 
