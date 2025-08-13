@@ -7,8 +7,8 @@
 # Optional (for --render/--shots):
 #          pip install playwright && playwright install firefox
 
-+import argparse, sys, time, random, pathlib,json, os
-+import threading
+import argparse, sys, time, random, pathlib,json, os
+import threading
 import requests
 from urllib.parse import urljoin, urlparse
 from collections import deque
@@ -243,6 +243,31 @@ def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval
     # Final newline if we were using carriage returns
     if use_cr:
         print("")
+
+# ===== Page limiter (max-pages) =====
+class PageLimiter:
+    """Thread-safe fetch reservation to enforce --max-pages."""
+    def __init__(self, max_pages:int):
+        self.max_pages = int(max_pages)
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def allow_fetch(self) -> bool:
+        """Reserve one fetch slot if available; return True if allowed."""
+        with self._lock:
+            if self.max_pages <= 0:
+                return True  # unlimited
+            if self._count >= self.max_pages:
+                return False
+            self._count += 1
+            return True
+
+    def remaining(self) -> int:
+        with self._lock:
+            if self.max_pages <= 0:
+                return 1_000_000_000
+            return max(0, self.max_pages - self._count)
+
 # ===== Auth & Session helpers =====
 def parse_kv_pairs(pairs):
     out = {}
@@ -482,7 +507,8 @@ from queue import Queue
 def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, json_records,
                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                  follow_only_if_match, renderer, shots, shot_mode, shots_dir,
-                 crawl_log, delay, timeout, verify_tls, verbose, save_debug, stats: CrawlStats):
+                 crawl_log, delay, timeout, verify_tls, verbose, save_debug, stats: CrawlStats,
+                 limiter: "PageLimiter", stop_evt: threading.Event):
 
     shot_taken = set()
 
@@ -491,7 +517,15 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             url, depth, parent = queue.get(timeout=1)
         except:
             return  # queue empty
+        try:
+            url, depth, parent = queue.get(timeout=1)
+        except:
+            return  # queue empty
 
+        if stop_evt.is_set():
+            queue.task_done()
+            continue
+        
         if url in visited:
             queue.task_done()
             continue
@@ -502,6 +536,14 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
 
         if crawl_log:
             print(f"{'  '*depth}[fetch] depth={depth} url={url}")
+
+        # Enforce max-pages before doing any network work
+        if not limiter.allow_fetch():
+            if crawl_log:
+                print(f"{DIM}[limit]{RESET} max-pages reached; skipping {url}")
+            stop_evt.set()
+            queue.task_done()
+            continue
 
         # Pick session based on URL/profile
         session = session_router.session_for(url)
@@ -532,6 +574,9 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             except Exception as e:
                 if verbose:
                     print(f"[shot] EXC {type(e).__name__}: {e} {url}")
+
+        # Count fetch after attempt (for stats only)
+        stats.on_fetch(depth)
 
         # Match check
         is_match = matcher(txt)
@@ -570,6 +615,8 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             )
             enq = 0
             for link in children:
+                if stop_evt.is_set():
+                    break
                 if link not in visited:
                     parent_map[link] = url
                     queue.put((link, depth+1, url))
@@ -588,13 +635,15 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                     max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                     follow_only_if_match=False, renderer=None, shots=False, shot_mode="matches",
                     shots_dir=None, crawl_log=False, delay=0, timeout=30, verify_tls=True,
-                    verbose=False, save_debug=False, max_workers=5, stats_interval=2.0):
+                    verbose=False, save_debug=False, max_workers=5, stats_interval=2.0,
+                    max_pages=0):
 
     queue = Queue()
     queue.put((root_url, 0, None))
 
     stats = CrawlStats()
     stop_evt = threading.Event()
+    limiter = PageLimiter(max_pages)
     stats_thread = None
     # Use carriage-return single line only when crawl_log is off (to avoid mixing)
     if stats_interval and stats_interval > 0:
@@ -611,7 +660,8 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                 crawl_worker, queue, session_router, matcher, matched, visited, parent_map, json_records,
                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                 follow_only_if_match, renderer, shots, shot_mode, shots_dir,
-                crawl_log, delay, timeout, verify_tls, verbose, save_debug, stats
+                crawl_log, delay, timeout, verify_tls, verbose, save_debug, stats,
+                limiter, stop_evt
             )
         queue.join()
         # Stop stats thread
@@ -796,7 +846,8 @@ def main():
             verbose=args.verbose,
             save_debug=args.save_debug,
             max_workers=args.max_workers,
-            stats_interval=args.stats_interval
+            stats_interval=args.stats_interval,
+            max_pages=args.max_pages
             )
 
 
