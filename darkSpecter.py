@@ -12,6 +12,8 @@ import requests
 from urllib.parse import urljoin, urlparse
 from collections import deque
 import re as re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
 
 # ===== ANSI Colors =====
 RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
@@ -422,13 +424,93 @@ def _safe_name(url, depth):
     return f"d{depth}_{ts}_{base[:120]}.png"
 
 # ===== Crawl =====
+def crawl_worker(queue, session, matcher, matched, visited, parent_map, json_records,
+                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
+                 take_screenshots, screenshot_dir, crawl_log, delay, timeout, verify_tls):
+    while True:
+        try:
+            url, depth, parent = queue.get(timeout=1)
+        except:
+            return  # Queue empty
+
+        if url in visited:
+            queue.task_done()
+            continue
+
+        visited.add(url)
+        if crawl_log:
+            print(f"{'  '*depth}[fetch] {url}")
+
+        txt = fetch_url(session, url, timeout=timeout, verify_tls=verify_tls)
+        if not txt:
+            if crawl_log:
+                print(f"{'  '*depth}[fail] {url}")
+            queue.task_done()
+            continue
+
+        # Save screenshot if requested
+        if take_screenshots:
+            try:
+                save_screenshot(url, screenshot_dir)
+            except Exception as e:
+                if crawl_log:
+                    print(f"{'  '*depth}[screenshot fail] {url} ({e})")
+
+        # Match check
+        if matcher(txt):
+            matched.add(url)
+            print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
+            json_records.append({
+                "url": url, "depth": depth, "parent": parent,
+                "chain": chain_for(url, parent_map)
+            })
+
+        # Recurse if depth limit not reached
+        if depth < max_depth:
+            children = extract_links(url, txt,
+                                     allow_offdomain=allow_offdomain,
+                                     allow_subdomains=allow_subdomains,
+                                     exclude_patterns=exclude_patterns)
+            enq = 0
+            for link in children:
+                if link not in visited:
+                    parent_map[link] = url
+                    queue.put((link, depth+1, url))
+                    enq += 1
+                    if crawl_log:
+                        print(f"{'  '*(depth+1)}[enqueue] {link}")
+            if crawl_log:
+                print(f"{'  '*depth}[links] extracted={len(children)} enqueued={enq} depth={depth+1}")
+
+        queue.task_done()
+        if delay > 0:
+            time.sleep(delay)
+
 def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_offdomain,
                     max_depth, max_pages, visited, matched, parent_map, json_records,
                     *, verify_tls=True, verbose=False, save_debug=False,
                     renderer=None, shots=False, shots_dir="screenshots",
                     shot_mode="matches", render_for_match=False,
                     shot_taken=None, follow_only_if_match=False,
-                    crawl_log=False, allow_subdomains=False,exclude_patterns=None):
+                    crawl_log=False, allow_subdomains=False,exclude_patterns=None,delay=0, timeout=30, verify_tls=True, max_workers=5):
+
+    queue = Queue()
+    queue.put((root_url, 0, None))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for _ in range(max_workers):
+            futures.append(executor.submit(
+                crawl_worker, queue, session, matcher, matched, visited, parent_map, json_records,
+                max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
+                take_screenshots, screenshot_dir, crawl_log, delay, timeout, verify_tls
+            ))
+        # Wait for queue to empty
+        queue.join()
+        # Cancel workers
+        for f in futures:
+            f.cancel()
+    
     if shot_taken is None:
         shot_taken = set()
 
@@ -618,6 +700,8 @@ def main():
                help="Treat subdomains (incl. www) as same site when --offdomain is not set")
     p.add_argument("--exclude-domains", nargs="+", default=[],
                help="Space-separated list of domains to skip (supports regex, e.g., '.*bitcoin.*' badsite.onion)")
+    p.add_argument("--max-workers", type=int, default=5,
+               help="Max concurrent fetches (workers) to run in parallel")
 
 
 
@@ -693,32 +777,26 @@ def main():
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
         crawl_recursive(
-            session_router=session_router,
+            session=session,
             root_url=seed,
             matcher=matcher,
-            timeout=args.timeout,
-            delay=args.delay,
-            allow_offdomain=args.offdomain,
-            max_depth=args.max_depth,
-            max_pages=args.max_pages,
-            visited=visited,
             matched=matched,
+            visited=visited,
             parent_map=parent_map,
             json_records=json_records,
-            verify_tls=not args.no_verify,
-            verbose=args.verbose,
-            save_debug=args.save_debug,
-            renderer=renderer,
-            shots=args.shots,
-            shots_dir=args.shots_dir,
-            shot_mode=args.shot_mode,
-            render_for_match=render_for_match,
-            shot_taken=shot_taken,
-            follow_only_if_match=args.follow_only_if_match,
-            crawl_log=args.crawl_log,
+            max_depth=args.max_depth,
+            allow_offdomain=args.allow_offdomain,
             allow_subdomains=args.allow_subdomains,
             exclude_patterns=compiled_excludes,
-            )
+            take_screenshots=args.screenshots,
+            screenshot_dir=args.screenshot_dir,
+            crawl_log=args.crawl_log,
+            delay=args.delay,
+            timeout=args.timeout,
+            verify_tls=not args.no_verify,
+            max_workers=args.max_workers
+        )
+
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
     if args.json:
