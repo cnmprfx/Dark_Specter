@@ -668,7 +668,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             if delay > 0:
                 time.sleep(delay + random.uniform(0, 0.8))
 
-        except Exception as e:
+         except Exception as e:
             # Surface the real reason for a “stuck” crawl
             print(f"[worker ERROR] {type(e).__name__}: {e}")
             traceback.print_exc()
