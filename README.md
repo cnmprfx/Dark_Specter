@@ -13,7 +13,7 @@
 
 
 
-Dark Spectre is a **multi-threaded darknet & clearnet crawler** designed for OSINT and investigative keyword hunting.  
+Dark Specter is a **multi-threaded darknet & clearnet crawler** designed for OSINT and investigative keyword hunting.  
 It supports **Tor**, **authentication**, **recursive spidering**, **screenshots**, **domain exclusion**, and **live crawl stats**.
 
 
