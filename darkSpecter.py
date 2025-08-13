@@ -620,7 +620,7 @@ def main():
                help="Show each page fetch and enqueue in real-time")
     p.add_argument("--allow-subdomains", action="store_true",
                help="Treat subdomains (incl. www) as same site when --offdomain is not set")
-    p.add_argument("--exclude-domains", nargs="+", default=[],dest="allow_offdomain", action="store_true",
+    p.add_argument("--exclude-domains", nargs="+", default=[],
                help="Space-separated list of domains to skip (supports regex, e.g., '.*bitcoin.*' badsite.onion)")
     p.add_argument("--max-workers", type=int, default=5,
                help="Max concurrent fetches (workers) to run in parallel")
@@ -708,7 +708,7 @@ def main():
             parent_map=parent_map,
             json_records=json_records,
             max_depth=args.max_depth,
-            allow_offdomain=args.allow_offdomain,
+            allow_offdomain=args.offdomain,
             allow_subdomains=args.allow_subdomains,
             exclude_patterns=compiled_excludes,
             follow_only_if_match=args.follow_only_if_match,
