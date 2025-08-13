@@ -715,7 +715,7 @@ def main():
             renderer=renderer,
             shots=args.shots,
             shot_mode=args.shot_mode,
-            shots_dir=args.screenshot_dir,
+            shots_dir=args.shots_dir,
             crawl_log=args.crawl_log,
             delay=args.delay,
             timeout=args.timeout,
