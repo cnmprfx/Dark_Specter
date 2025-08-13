@@ -11,6 +11,7 @@ import argparse, sys, time, random, pathlib, re, json, os
 import requests
 from urllib.parse import urljoin, urlparse
 from collections import deque
+import re as re
 
 # ===== ANSI Colors =====
 RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
@@ -47,6 +48,21 @@ def is_http_like(url):
     return scheme in ("http", "https", "")
 
 def same_domain(u1, u2):
+    def _host(h):
+    return (h or "").lower().strip()
+
+def _strip_www(h):
+    h = _host(h)
+    return h[4:] if h.startswith("www.") else h
+
+def same_site(u1, u2):
+    """Consider subdomains the same 'site' (e.g., www.example.com ~ example.com)."""
+    h1 = _strip_www(urlparse(u1).hostname)
+    h2 = _strip_www(urlparse(u2).hostname)
+    if not h1 or not h2:
+        return False
+    return h1 == h2 or h1.endswith("." + h2) or h2.endswith("." + h1)
+
     h1 = (urlparse(u1).hostname or "").lower()
     h2 = (urlparse(u2).hostname or "").lower()
     return h1 == h2
@@ -86,7 +102,8 @@ def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug
             print(f"[http] EXC {type(e).__name__}: {e} {url}")
         return None
 
-def extract_links(base_url, html, allow_offdomain=False):
+PLAIN_URL_RE = _re.compile(r'\bhttps?://[^\s"\'<>)]+', _re.IGNORECASE)
+def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False):
     try:
         from bs4 import BeautifulSoup
     except ImportError:
@@ -94,18 +111,38 @@ def extract_links(base_url, html, allow_offdomain=False):
         sys.exit(1)
 
     links = set()
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    # 1) Anchors
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
-        abs_url = urljoin(base_url, href)
+        links.add(urljoin(base_url, href))
+
+    # 2) Image map <area>
+    for ar in soup.find_all("area", href=True):
+        href = (ar.get("href") or "").strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        links.add(urljoin(base_url, href))
+
+    # 3) Plain-text URLs
+    for m in PLAIN_URL_RE.finditer(html or ""):
+        links.add(m.group(0))
+
+    # Scope filtering
+    filtered = set()
+    for abs_url in links:
         if not is_http_like(abs_url):
             continue
-        if not allow_offdomain and not same_domain(base_url, abs_url):
-            continue
-        links.add(abs_url)
-    return list(links)
+        if allow_offdomain:
+            filtered.add(abs_url)
+        else:
+            if same_domain(base_url, abs_url) or (allow_subdomains and same_site(base_url, abs_url)):
+                filtered.add(abs_url)
+    return list(filtered)
+
 
 def build_matcher(phrase, use_regex):
     if use_regex:
@@ -363,7 +400,7 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
                     renderer=None, shots=False, shots_dir="screenshots",
                     shot_mode="matches", render_for_match=False,
                     shot_taken=None, follow_only_if_match=False,
-                    crawl_log=False):
+                    crawl_log=False, allow_subdomains=False):
     if shot_taken is None:
         shot_taken = set()
 
@@ -461,7 +498,12 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
         # Spider entire app by default; only restrict when --follow-only-if-match is set
         should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
         if should_expand:
-            children = extract_links(url, txt, allow_offdomain=allow_offdomain)
+            children = extract_links(
+                            url, txt,
+                            allow_offdomain=allow_offdomain,
+                            allow_subdomains=allow_subdomains
+                            )
+
             enq = 0
             for link in children:
                 if link not in visited:
@@ -543,6 +585,9 @@ def main():
                    help="Playwright wait_until condition (default: networkidle)")
     p.add_argument("--crawl-log", action="store_true",
                help="Show each page fetch and enqueue in real-time")
+    p.add_argument("--allow-subdomains", action="store_true",
+               help="Treat subdomains (incl. www) as same site when --offdomain is not set")
+
 
     # Help banner handling
     if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
@@ -638,8 +683,8 @@ def main():
             render_for_match=render_for_match,
             shot_taken=shot_taken,
             follow_only_if_match=args.follow_only_if_match,
-            crawl_log=args.crawl_log,
-        )
+            crawl_log=args.crawl_log,allow_subdomains=args.allow_subdomains,
+            )
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
     if args.json:
