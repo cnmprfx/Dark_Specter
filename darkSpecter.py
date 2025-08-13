@@ -224,7 +224,7 @@ class CrawlStats:
             }
 
 def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval: float, use_cr: bool,
-                   matched_set: set, visited_set: set | None = None):
+                   matched_set=None, visited_set=None):
     # Print a single line periodically with carriage-return (unless crawl_log is on)
     while not stop_evt.is_set():
         snap = stats.snapshot()
