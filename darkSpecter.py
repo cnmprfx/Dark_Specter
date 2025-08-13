@@ -47,6 +47,17 @@ def is_http_like(url):
     scheme = (urlparse(url).scheme or "").lower()
     return scheme in ("http", "https", "")
 
+def is_excluded(url, exclude_list):
+    """Return True if URL's hostname matches an excluded domain or subdomain."""
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return False
+    for ex in exclude_list:
+        ex = ex.lower().strip()
+        if host == ex or host.endswith("." + ex):
+            return True
+    return False
+
 def same_domain(u1, u2):
     def _host(h):
     return (h or "").lower().strip()
@@ -103,7 +114,9 @@ def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug
         return None
 
 PLAIN_URL_RE = _re.compile(r'\bhttps?://[^\s"\'<>)]+', _re.IGNORECASE)
-def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False):
+def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False, exclude_domains=None):
+    if exclude_domains is None:
+        exclude_domains = []
     try:
         from bs4 import BeautifulSoup
     except ImportError:
@@ -135,6 +148,9 @@ def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False)
     filtered = set()
     for abs_url in links:
         if not is_http_like(abs_url):
+            continue
+        # Skip excluded domains
+        if is_excluded(abs_url, exclude_domains):
             continue
         if allow_offdomain:
             filtered.add(abs_url)
@@ -501,7 +517,8 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
             children = extract_links(
                             url, txt,
                             allow_offdomain=allow_offdomain,
-                            allow_subdomains=allow_subdomains
+                            allow_subdomains=allow_subdomains,
+                            exclude_domains=exclude_domains
                             )
 
             enq = 0
@@ -587,6 +604,9 @@ def main():
                help="Show each page fetch and enqueue in real-time")
     p.add_argument("--allow-subdomains", action="store_true",
                help="Treat subdomains (incl. www) as same site when --offdomain is not set")
+    p.add_argument("--exclude-domains", nargs="+", default=[],
+               help="Space-separated list of domains to skip entirely (e.g., example.com badsite.onion)")
+
 
 
     # Help banner handling
@@ -683,7 +703,9 @@ def main():
             render_for_match=render_for_match,
             shot_taken=shot_taken,
             follow_only_if_match=args.follow_only_if_match,
-            crawl_log=args.crawl_log,allow_subdomains=args.allow_subdomains,
+            crawl_log=args.crawl_log,
+            allow_subdomains=args.allow_subdomains,
+            exclude_domains=args.exclude_domains,
             )
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
