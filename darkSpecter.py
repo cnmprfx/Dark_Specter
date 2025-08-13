@@ -67,25 +67,28 @@ def is_excluded(url, compiled_patterns):
         return False
     return any(p.search(host) for p in compiled_patterns)
 
-def same_domain(u1, u2):
-    def _host(h):
-        return (h or "").lower().strip()
+# --- Host helpers (drop-in replacement) ---
+def _host(h: str) -> str:
+    return (h or "").lower().strip()
 
-def _strip_www(h):
+def _strip_www(h: str) -> str:
     h = _host(h)
     return h[4:] if h.startswith("www.") else h
 
+def same_domain(u1, u2):
+    """Strict host equality (foo.example.com == foo.example.com)."""
+    return _host(urlparse(u1).hostname) == _host(urlparse(u2).hostname)
+
 def same_site(u1, u2):
-    """Consider subdomains the same 'site' (e.g., www.example.com ~ example.com)."""
+    """
+    Consider subdomains the same 'site':
+    www.example.com ~ example.com, blog.example.com ~ example.com, etc.
+    """
     h1 = _strip_www(urlparse(u1).hostname)
     h2 = _strip_www(urlparse(u2).hostname)
     if not h1 or not h2:
         return False
     return h1 == h2 or h1.endswith("." + h2) or h2.endswith("." + h1)
-
-    h1 = (urlparse(u1).hostname or "").lower()
-    h2 = (urlparse(u2).hostname or "").lower()
-    return h1 == h2
 
 def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug=False):
     try:
@@ -527,6 +530,7 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
                             url, txt,
                             allow_offdomain=allow_offdomain,
                             allow_subdomains=allow_subdomains,
+                            exclude_patterns=exclude_patterns,
                             )
 
             enq = 0
