@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # Dark Spectre - Tor Keyword Hunter
 # Spiders entire apps (default) + per-URL/host session profiles (--session-map)
-# Regex/Literal match + JSON + Auth (basic/form/bearer global or per-profile)
-# Verbose/Debug + Optional Headless Rendering (Playwright) + Screenshots
-# Concurrency with live stats + max-pages limiter
+# Features: Regex/Literal + JSON + Auth (basic/form/bearer global or per-profile)
+#           Verbose/Debug + Live Stats + Optional Headless Rendering (Playwright)
+#           Screenshots via a dedicated render thread (de-duped per URL)
+# Deps:    pip install requests[socks] beautifulsoup4
+# Optional (for --render/--shots):
+#          pip install playwright && playwright install firefox
 
 import argparse, sys, time, random, pathlib, json, os, re, threading, traceback
 import requests
@@ -11,30 +14,30 @@ from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 
-# ===== ANSI Colors =====
-RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
-
-ASCII_BANNER = rf"""
-{RED}  ____             _        {PURPLE}____                  _
-{RED} |  _ \  __ _ _ __| | __   {PURPLE}/ ___| _ __   ___  ___| |_ ___ _ __
-{RED} | | | |/ _` | '__| |/ /   {PURPLE}\___ \| '_ \ / _ \/ __| __/ _ \ '__|
-{RED} | |_| | (_| | |  |   <     {PURPLE}___) | |_) |  __/ (__| ||  __| |
-{RED} |____/ \__,_|_|  |_|\_\   {PURPLE}|____/| .__/ \___|\___|\__\___|_|
-{PURPLE}                                 |_|
-{RESET}                ==== {RED}Dark {PURPLE}Spectre{RESET} - Tor Keyword Hunter ====
-"""
-
-DESCRIPTION = f"""{RED}Dark Spectre{RESET} hunts for keywords/regex on darknet & clearnet URLs via Tor.
-Spiders entire apps by default. Supports regex matching, JSON reports, per-URL auth,
-verbose/debug, optional rendering & screenshots, and concurrent crawling with live stats.
-"""
-
-# ---- global counters/locks for worker bookkeeping ----
+# ===== Global locks for shared state =====
 INFLIGHT = 0
 INFLIGHT_LOCK = threading.Lock()
 VISITED_LOCK = threading.Lock()
 MATCHED_LOCK = threading.Lock()
 PARENT_LOCK = threading.Lock()
+
+# ===== ANSI Colors =====
+RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
+
+ASCII_BANNER = rf"""
+{RED}  ____             _        {PURPLE}____                  _            
+{RED} |  _ \  __ _ _ __| | __   {PURPLE}/ ___| _ __   ___  ___| |_ ___ _ __ 
+{RED} | | | |/ _` | '__| |/ /   {PURPLE}\___ \| '_ \ / _ \/ __| __/ _ \ '__|
+{RED} | |_| | (_| | |  |   <     {PURPLE}___) | |_) |  __/ (__| ||  __/ |   
+{RED} |____/ \__,_|_|  |_|\_\   {PURPLE}|____/| .__/ \___|\___|\__\___|_|   
+{PURPLE}                                 |_|                           
+{RESET}                ==== {RED}Dark {PURPLE}Spectre{RESET} - Tor Keyword Hunter ====
+"""
+
+DESCRIPTION = f"""{RED}Dark Spectre{RESET} hunts for keywords/regex on darknet & clearnet URLs via Tor.
+It spiders entire apps by default (keeps crawling even when a page doesn't match).
+Supports: regex, JSON reports, global/per-URL auth, verbose/debug, live stats, rendering & screenshots.
+"""
 
 # ===== Helpers =====
 def load_urls(path):
@@ -54,14 +57,14 @@ def is_http_like(url):
 
 def compile_exclude_patterns(patterns):
     compiled = []
-    for pat in patterns:
+    for pat in patterns or []:
         pat = pat.strip()
         if not pat:
             continue
         try:
             compiled.append(re.compile(pat, re.IGNORECASE))
         except re.error as e:
-            print(f"[warn] Invalid regex in --exclude-domains: {pat} ({e})", file=sys.stderr)
+            print(f"[warn] Invalid regex in exclude-domains: {pat} ({e})", file=sys.stderr)
     return compiled
 
 def is_excluded(url, compiled_patterns):
@@ -79,9 +82,11 @@ def _strip_www(h: str) -> str:
     return h[4:] if h.startswith("www.") else h
 
 def same_domain(u1, u2):
+    """Strict host equality (foo.example.com == foo.example.com)."""
     return _host(urlparse(u1).hostname) == _host(urlparse(u2).hostname)
 
 def same_site(u1, u2):
+    """Consider subdomains the same 'site'."""
     h1 = _strip_www(urlparse(u1).hostname)
     h2 = _strip_www(urlparse(u2).hostname)
     if not h1 or not h2:
@@ -135,21 +140,25 @@ def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False,
     links = set()
     soup = BeautifulSoup(html or "", "html.parser")
 
+    # <a>
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
         links.add(urljoin(base_url, href))
 
+    # <area>
     for ar in soup.find_all("area", href=True):
         href = (ar.get("href") or "").strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
         links.add(urljoin(base_url, href))
 
+    # plain text URLs
     for m in PLAIN_URL_RE.finditer(html or ""):
         links.add(m.group(0))
 
+    # Scope filtering
     filtered = set()
     for abs_url in links:
         if not is_http_like(abs_url):
@@ -189,15 +198,21 @@ class CrawlStats:
         self.matched = 0
         self.max_depth = 0
         self.fetched = 0
-    def on_fetch(self, depth):
+
+    def on_visit(self, depth):
         with self.lock:
             self.visited += 1
-            self.fetched += 1
             if depth > self.max_depth:
                 self.max_depth = depth
+
+    def on_fetch(self):
+        with self.lock:
+            self.fetched += 1
+
     def on_match(self):
         with self.lock:
             self.matched += 1
+
     def snapshot(self):
         with self.lock:
             return {
@@ -224,7 +239,7 @@ def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval
             print(line, flush=True)
         stop_evt.wait(interval)
     if use_cr:
-        print()
+        print("")
 
 # ===== Page limiter (max-pages) =====
 class PageLimiter:
@@ -233,14 +248,16 @@ class PageLimiter:
         self.max_pages = int(max_pages)
         self._count = 0
         self._lock = threading.Lock()
+
     def allow_fetch(self) -> bool:
         with self._lock:
             if self.max_pages <= 0:
-                return True
+                return True  # unlimited
             if self._count >= self.max_pages:
                 return False
             self._count += 1
             return True
+
     def remaining(self) -> int:
         with self._lock:
             if self.max_pages <= 0:
@@ -393,12 +410,14 @@ def make_session_from_profile(base_session, prof, socks_host, socks_port, timeou
     return s
 
 class SessionRouter:
+    """Chooses a requests.Session based on URL, using session-map profiles."""
     def __init__(self, base_session, profiles, socks_host, socks_port, timeout, verbose=False):
         self.base = base_session
         self.profiles = profiles or []
-        self.cache = {}
+        self.cache = {}  # prof_idx -> Session
         self.socks_host = socks_host; self.socks_port = socks_port
         self.timeout = timeout; self.verbose = verbose
+
     def session_for(self, url):
         for idx, prof in enumerate(self.profiles):
             if profile_matches(url, prof):
@@ -426,6 +445,7 @@ class Renderer:
         )
         self.wait_until = wait_until
         self.timeout_ms = timeout_ms
+
     def render(self, url, screenshot_path=None, full_page=True):
         page = self._context.new_page()
         page.goto(url, wait_until=self.wait_until, timeout=self.timeout_ms)
@@ -434,6 +454,7 @@ class Renderer:
         html = page.content()
         page.close()
         return html
+
     def close(self):
         try:
             self._context.close()
@@ -453,29 +474,30 @@ def _safe_name(url, depth):
 # ===== Worker & Crawl =====
 def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, json_records,
                  max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
-                 follow_only_if_match, renderer, shots, shot_mode, shots_dir,
-                 crawl_log, delay, timeout, verify_tls, verbose, save_debug,render_queue=None,
-                 stats: CrawlStats, limiter: "PageLimiter", stop_evt: threading.Event):
-
-    shot_taken = set()
-    shots_dir = shots_dir or "screenshots"
+                 follow_only_if_match, crawl_log, delay, timeout, verify_tls, verbose, save_debug,
+                 stats: CrawlStats, limiter: PageLimiter, stop_evt: threading.Event,
+                 render_queue=None, shots=False, shot_mode="matches"):
 
     while not stop_evt.is_set():
         try:
-            url, depth, parent = queue.get(timeout=1)
+            url, depth, parent = queue.get(timeout=0.5)
         except Empty:
             continue
+        except Exception:
+            break
 
         with INFLIGHT_LOCK:
             global INFLIGHT
             INFLIGHT += 1
 
         try:
-            # de-dupe visited early
+            # de-dupe / mark visited early
             with VISITED_LOCK:
                 if url in visited:
+                    queue.task_done()
                     continue
                 visited.add(url)
+            stats.on_visit(depth)
 
             if parent:
                 with PARENT_LOCK:
@@ -485,95 +507,51 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             if crawl_log:
                 print(f"{'  '*depth}[fetch] depth={depth} url={url}")
 
-            # max-pages limiter
+            # Enforce max-pages
             if not limiter.allow_fetch():
+                if crawl_log:
+                    print(f"{DIM}[limit]{RESET} max-pages reached, skipping fetch")
+                queue.task_done()
                 continue
 
-            # pick session based on URL/profile
+            # Pick session based on URL/profile
             session = session_router.session_for(url)
 
-            # fetch
+            # Fetch
             txt = fetch_text(session, url, timeout,
                              verify_tls=verify_tls,
                              verbose=verbose,
                              save_debug=save_debug)
-            stats.on_fetch(depth)
+            stats.on_fetch()
 
             if not txt:
                 if crawl_log:
                     print(f"{DIM}[fail]{RESET} {url}")
+                queue.task_done()
                 continue
 
-            # renderer + optional screenshots (ALL mode)
- # 2) Optional rendering for matching; optionally screenshot ALL pages
-
-        if renderer and render_for_match:
-             try:
-                 ss_path = None
-                 if shots and shot_mode == "all" and (url not in shot_taken):
-
-                    if render_queue:
-                        render_queue.put((url, depth))
-                    else:
-                        os.makedirs(shots_dir, exist_ok=True)
-                        ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                        txt = renderer.render(url, screenshot_path=ss_path)
-                        if ss_path:
-                            shot_taken.add(url)
-                            if verbose:
-                                print(f"[shot] saved {ss_path}")
-                        elif verbose:
-                            print(f"[render] {url} -> no-shot")
-                else:
-                    txt = renderer.render(url)
-             except Exception as e:
-                 if verbose:
-                     print(f"[render] EXC {type(e).__name__}: {e} {url}")
- 
-         elif renderer and shots and shot_mode == "all" and (url not in shot_taken):
-             # Screenshot ALL pages even if not rendering for match (don’t replace txt)
-             try:
-                 if render_queue:
+            # Match check
+            is_match = matcher(txt)
+            if is_match:
+                with MATCHED_LOCK:
+                    matched.add(url)
+                print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
+                json_records.append({
+                    "url": url, "depth": depth, "parent": parent,
+                    "chain": chain_for(url, parent_map)
+                })
+                # Schedule screenshot on match (matches mode)
+                if shots and shot_mode == "matches" and render_queue is not None:
                     render_queue.put((url, depth))
-                else:
-                    os.makedirs(shots_dir, exist_ok=True)
-                    ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                    renderer.render(url, screenshot_path=ss_path)
-                    shot_taken.add(url)
-                    if verbose:
-                        print(f"[shot] saved {ss_path}")
-             except Exception as e:
-                 if verbose:
-                     print(f"[shot] EXC {type(e).__name__}: {e} {url}")
 
-         # Match / record
-         is_match = matcher(txt)
-         if is_match:
-             matched.add(url)
-             print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
-             json_records.append({
-                 "url": url, "depth": depth, "parent": parent,
-                 "chain": chain_for(url, parent_map)
-             })
-             # Screenshot on match (if not already shot in ALL mode)
-             if shots and (shot_mode == "matches") and renderer and (url not in shot_taken):
-                 try:
-                     if render_queue:
-                        render_queue.put((url, depth))
-                    else:
-                        os.makedirs(shots_dir, exist_ok=True)
-                        ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                        renderer.render(url, screenshot_path=ss_path)
-                        shot_taken.add(url)
-                        if verbose:
-                            print(f"[shot] saved {ss_path}")
-                 except Exception as e:
-                     if verbose:
-                         print(f"[shot] EXC {type(e).__name__}: {e} {url}")
             elif crawl_log:
                 print(f"{'  '*depth}[....] {url}")
 
-            # expand children
+            # Screenshot ALL pages (enqueue to render thread)
+            if shots and shot_mode == "all" and render_queue is not None:
+                render_queue.put((url, depth))
+
+            # Spider children
             should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
             if should_expand:
                 children = extract_links(
@@ -604,8 +582,10 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             print(f"[worker ERROR] {type(e).__name__}: {e}")
             traceback.print_exc()
         finally:
-            # exactly one task_done per get()
-            queue.task_done()
+            try:
+                queue.task_done()
+            except Exception:
+                pass
             with INFLIGHT_LOCK:
                 INFLIGHT -= 1
 
@@ -623,7 +603,8 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
     stop_evt = threading.Event()
     limiter = PageLimiter(max_pages)
 
-    # live stats thread (CR line if crawl_log is off)
+    # Live stats thread (single line when crawl_log is off)
+    stats_thread = None
     if stats_interval and stats_interval > 0:
         stats_thread = threading.Thread(
             target=_stats_printer,
@@ -631,27 +612,58 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
             daemon=True,
         )
         stats_thread.start()
-    else:
-        stats_thread = None
 
+    # Optional render queue/worker (single thread, serial Playwright use)
+    render_queue = None
+    render_thread = None
+    SENTINEL = object()
+    if renderer and shots:
+        shots_dir = shots_dir or "screenshots"
+        os.makedirs(shots_dir, exist_ok=True)
+        render_queue = Queue()
+
+        def render_worker():
+            while not stop_evt.is_set():
+                try:
+                    item = render_queue.get(timeout=0.5)
+                except Empty:
+                    continue
+                if item is SENTINEL:
+                    render_queue.task_done()
+                    break
+                url, depth = item
+                try:
+                    ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                    renderer.render(url, screenshot_path=ss_path)
+                    if verbose:
+                        print(f"[shot] saved {ss_path}")
+                except Exception as e:
+                    print(f"[shot] EXC {type(e).__name__}: {e} {url}")
+                finally:
+                    render_queue.task_done()
+
+        render_thread = threading.Thread(target=render_worker, daemon=True)
+        render_thread.start()
+
+    # Crawl workers
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for _ in range(max_workers):
             executor.submit(
-                crawl_worker,
-                queue, session_router, matcher, matched, visited, parent_map, json_records,
-                args.max_depth, args.allow_offdomain, args.allow_subdomains, args.exclude_domains,
-                args.follow_only_if_match, renderer, args.shots, args.shot_mode, args.shots_dir,
-                args.crawl_log, args.delay, args.timeout, not args.no_verify, args.verbose, args.save_debug,
-                render_queue  # <-- new
+                crawl_worker, q, session_router, matcher, matched, visited, parent_map, json_records,
+                max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
+                follow_only_if_match, crawl_log, delay, timeout, verify_tls, verbose, save_debug,
+                stats, limiter, stop_evt, render_queue, shots, shot_mode
             )
-
-        # Wait for all tasks to complete
         q.join()
-        # IMPORTANT: signal workers to stop BEFORE leaving the executor context
-        stop_evt.set()
 
-    # stop stats thread after workers signaled
-    if stats_thread:
+    # Signal shutdown for stats + render threads
+    stop_evt.set()
+    if render_queue:
+        render_queue.put(SENTINEL)
+        render_queue.join()
+        if render_thread:
+            render_thread.join(timeout=1.0)
+    if stats_interval and stats_interval > 0 and stats_thread:
         stats_thread.join(timeout=1.0)
 
 # ===== Main =====
@@ -676,8 +688,12 @@ def main():
     p.add_argument("--max-pages", type=int, default=400, help="Safety cap on total fetched pages (default: 400)")
     p.add_argument("--delay", type=float, default=1.2, help="Base delay between requests (default: 1.2)")
     p.add_argument("--offdomain", action="store_true", help="Allow following links to other domains/hidden services")
+    p.add_argument("--allow-subdomains", action="store_true",
+                   help="Treat subdomains (incl. www) as same site when --offdomain is not set")
+    p.add_argument("--exclude-domains", nargs="+", default=[],
+                   help="Space-separated domain patterns to skip (regex OK, e.g., '.*bitcoin.*' badsite.onion)")
     p.add_argument("--follow-only-if-match", action="store_true",
-                   help="Use legacy behavior: only follow links when the current page matches")
+                   help="Legacy behavior: only follow links when the current page matches")
 
     # Tor & HTTP
     p.add_argument("--socks-host", default="127.0.0.1", help="Tor SOCKS host")
@@ -710,7 +726,7 @@ def main():
 
     # Screenshots & Rendering
     p.add_argument("--shots", action="store_true",
-                   help="Take screenshots (saved to --shots-dir). Default mode captures only matched pages.")
+                   help="Take screenshots (saved via render thread). Default captures only matched pages.")
     p.add_argument("--shots-dir", default="screenshots",
                    help="Directory to store screenshots (default: screenshots)")
     p.add_argument("--shot-mode", choices=["matches","all"], default="matches",
@@ -722,19 +738,13 @@ def main():
     p.add_argument("--render-wait", choices=["load","domcontentloaded","networkidle"], default="networkidle",
                    help="Playwright wait_until condition (default: networkidle)")
 
-    # Logs & scope
-    p.add_argument("--crawl-log", action="store_true",
-               help="Show each page fetch and enqueue in real-time")
-    p.add_argument("--allow-subdomains", action="store_true",
-               help="Treat subdomains (incl. www) as same site when --offdomain is not set")
-    p.add_argument("--exclude-domains", nargs="+", default=[],
-               help="Space-separated list of domains to skip (regex supported, e.g., '.*bitcoin.*' badsite.onion)")
-
-    # Concurrency & stats
+    # Concurrency / telemetry
     p.add_argument("--max-workers", type=int, default=5,
-               help="Max concurrent fetches (workers) to run in parallel")
+                   help="Max concurrent fetch workers")
     p.add_argument("--stats-interval", type=float, default=2.0,
-               help="Seconds between live stats updates (0 to disable)")
+                   help="Seconds between live stats updates (0 to disable)")
+    p.add_argument("--crawl-log", action="store_true",
+                   help="Show each page fetch and enqueue in real-time")
 
     # Help banner handling
     if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
@@ -774,34 +784,6 @@ def main():
                               success_regex=args.success_regex)
             if not ok:
                 print(f"{DIM}[auth]{RESET} form auth failed (continuing without guaranteed session)")
-# Create render queue if screenshots are enabled
-    render_queue = None
-    if args.shots and args.render:
-        from queue import Queue
-        render_queue = Queue()
-
-        def render_worker():
-            while True:
-                try:
-                    url, depth = render_queue.get(timeout=2)
-                except:
-                    if crawl_done.is_set():
-                        break
-                    continue
-                try:
-                    os.makedirs(args.shots_dir, exist_ok=True)
-                    ss_path = os.path.join(args.shots_dir, _safe_name(url, depth))
-                    renderer.render(url, screenshot_path=ss_path)
-                    shot_taken.add(url)
-                    if args.verbose:
-                        print(f"[shot] saved {ss_path}")
-                except Exception as e:
-                    print(f"[shot] EXC {e} {url}")
-                finally:
-                    render_queue.task_done()
-
-        crawl_done = threading.Event()
-        threading.Thread(target=render_worker, daemon=True).start()
 
     # Load per-URL/host session profiles and router
     profiles = load_session_map(args.session_map) if args.session_map else []
