@@ -33,18 +33,19 @@ It supports **Tor**, **authentication**, **recursive spidering**, **screenshots*
 
 
 ## Requirements
-
+```
 bash
 pip install requests beautifulsoup4 playwright
 playwright install chromium
 
+```
 
 If crawling `.onion` sites:
-
+```
 bash
 sudo apt install tor
 systemctl start tor
-
+```
 
 Run with:
 
