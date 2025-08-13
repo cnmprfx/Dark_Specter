@@ -2,7 +2,8 @@
 
 # Dark Specter - Tor Keyword Hunter
 
-![alt text](https://images.app.goo.gl/TrxkhAZwVyR2xCM28)
+<img width="468" height="626" alt="image" src="https://github.com/user-attachments/assets/7c278df5-efb4-40ba-83ff-3e06e2e64979" />
+
 
 
 
