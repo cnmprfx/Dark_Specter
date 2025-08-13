@@ -8,13 +8,20 @@
 #          pip install playwright && playwright install firefox
 
 import argparse, sys, time, random, pathlib,json, os
-import threading
 import requests
 from urllib.parse import urljoin, urlparse
 from collections import deque
 import re as re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
+import threading, traceback
+
+# light global-ish counters for stats
+INFLIGHT = 0
+INFLIGHT_LOCK = threading.Lock()
+VISITED_LOCK = threading.Lock()
+MATCHED_LOCK = threading.Lock()
+PARENT_LOCK = threading.Lock()
 
 # ===== ANSI Colors =====
 RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
@@ -511,85 +518,57 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                  limiter: "PageLimiter", stop_evt: threading.Event):
 
     shot_taken = set()
+    print("[worker] started")
 
     while True:
-        try:
-            url, depth, parent = queue.get(timeout=1)
-        except:
-            return  # queue empty
-        try:
-            url, depth, parent = queue.get(timeout=1)
-        except:
-            return  # queue empty
-
-        if stop_evt.is_set():
-            queue.task_done()
-            continue
-        
-        if url in visited:
-            queue.task_done()
-            continue
-
-        visited.add(url)
-        if parent and url not in parent_map:
-            parent_map[url] = parent
-
-        if crawl_log:
-            print(f"{'  '*depth}[fetch] depth={depth} url={url}")
-
-        # Enforce max-pages before doing any network work
-        if not limiter.allow_fetch():
-            if crawl_log:
-                print(f"{DIM}[limit]{RESET} max-pages reached; skipping {url}")
-            stop_evt.set()
-            queue.task_done()
-            continue
-
-        # Pick session based on URL/profile
-        session = session_router.session_for(url)
-
-        # Fetch HTML
-        txt = fetch_text(session, url, timeout,
-                         verify_tls=verify_tls,
-                         verbose=verbose,
-                         save_debug=save_debug)
-        # Count after attempt (only once per URL)
-        stats.on_fetch(depth)
-
-        if not txt:
-            if crawl_log:
-                print(f"{DIM}[fail]{RESET} {url}")
-            queue.task_done()
-            continue
-
-        # Renderer + optional screenshots
-        if renderer and shots and shot_mode == "all" and (url not in shot_taken):
+            
             try:
-                os.makedirs(shots_dir, exist_ok=True)
-                ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                renderer.render(url, screenshot_path=ss_path)
-                shot_taken.add(url)
-                if verbose:
-                    print(f"[shot] saved {ss_path}")
-            except Exception as e:
-                if verbose:
-                    print(f"[shot] EXC {type(e).__name__}: {e} {url}")
+                url, depth, parent = queue.get(timeout=1)
+            except Exception:
+                return  # queue empty (for this worker)
 
-        # Count fetch after attempt (for stats only)
-        stats.on_fetch(depth)
+            with INFLIGHT_LOCK:
+                global INFLIGHT
+                INFLIGHT += 1
 
-        # Match check
-        is_match = matcher(txt)
-        if is_match:
-            matched.add(url)
-            print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
-            stats.on_match()
-            json_records.append({
-                "url": url, "depth": depth, "parent": parent,
-                "chain": chain_for(url, parent_map)
-            })
-            # Screenshot on match (matches mode)
-            if shots and shot_mode == "matches" and renderer and (url not in shot_taken):
+            # de-dupe / mark visited early
+            with VISITED_LOCK:
+                if url in visited:
+                    return_to_done = True
+                else:
+                    visited.add(url)
+                    return_to_done = False
+
+            if return_to_done:
+                queue.task_done()
+                with INFLIGHT_LOCK:
+                    INFLIGHT -= 1
+                continue
+
+            if parent:
+                with PARENT_LOCK:
+                    if url not in parent_map:
+                        parent_map[url] = parent
+
+            if crawl_log:
+                print(f"{'  '*depth}[fetch] depth={depth} url={url}")
+
+            # Pick session based on URL/profile
+            session = session_router.session_for(url)
+
+            # Fetch HTML
+            txt = fetch_text(session, url, timeout,
+                             verify_tls=verify_tls,
+                             verbose=verbose,
+                             save_debug=save_debug)
+
+            if not txt:
+                if crawl_log:
+                    print(f"{DIM}[fail]{RESET} {url}")
+                continue
+
+            # Renderer + optional screenshots (ALL mode)
+            if renderer and shots and shot_mode == "all" and (url not in shot_taken):
                 try:
                     os.makedirs(shots_dir, exist_ok=True)
                     ss_path = os.path.join(shots_dir, _safe_name(url, depth))
@@ -601,34 +580,69 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                     if verbose:
                         print(f"[shot] EXC {type(e).__name__}: {e} {url}")
 
-        elif crawl_log:
-            print(f"{'  '*depth}[....] {url}")
+            # Match check
+            is_match = matcher(txt)
+            if is_match:
+                with MATCHED_LOCK:
+                    matched.add(url)
+                print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
+                json_records.append({
+                    "url": url, "depth": depth, "parent": parent,
+                    "chain": chain_for(url, parent_map)
+                })
+                # Screenshot on match (matches mode)
+                if shots and shot_mode == "matches" and renderer and (url not in shot_taken):
+                    try:
+                        os.makedirs(shots_dir, exist_ok=True)
+                        ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                        renderer.render(url, screenshot_path=ss_path)
+                        shot_taken.add(url)
+                        if verbose:
+                            print(f"[shot] saved {ss_path}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"[shot] EXC {type(e).__name__}: {e} {url}")
+            elif crawl_log:
+                print(f"{'  '*depth}[....] {url}")
 
-        # Spider children
-        should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
-        if should_expand:
-            children = extract_links(
-                url, txt,
-                allow_offdomain=allow_offdomain,
-                allow_subdomains=allow_subdomains,
-                exclude_patterns=exclude_patterns
-            )
-            enq = 0
-            for link in children:
-                if stop_evt.is_set():
-                    break
-                if link not in visited:
-                    parent_map[link] = url
-                    queue.put((link, depth+1, url))
-                    enq += 1
-                    if crawl_log:
-                        print(f"{'  '*(depth+1)}[enqueue] {link}")
-            if crawl_log:
-                print(f"{'  '*depth}[links] extracted={len(children)} enqueued={enq} depth={depth+1}")
+            # Spider children
+            should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
+            if should_expand:
+                children = extract_links(
+                    url, txt,
+                    allow_offdomain=allow_offdomain,
+                    allow_subdomains=allow_subdomains,
+                    exclude_patterns=exclude_patterns
+                )
+                enq = 0
+                for link in children:
+                    with VISITED_LOCK:
+                        already = (link in visited)
+                    if not already:
+                        with PARENT_LOCK:
+                            if link not in parent_map:
+                                parent_map[link] = url
+                        queue.put((link, depth+1, url))
+                        enq += 1
+                        if crawl_log:
+                            print(f"{'  '*(depth+1)}[enqueue] {link}")
+                if crawl_log:
+                    print(f"{'  '*depth}[links] extracted={len(children)} enqueued={enq} depth={depth+1}")
 
-        queue.task_done()
-        if delay > 0:
-            time.sleep(delay + random.uniform(0, 0.8))
+            if delay > 0:
+                time.sleep(delay + random.uniform(0, 0.8))
+
+        except Exception as e:
+            # Surface the real reason for a “stuck” crawl
+            print(f"[worker ERROR] {type(e).__name__}: {e}")
+            traceback.print_exc()
+        finally:
+            try:
+                queue.task_done()
+            except Exception:
+                pass
+            with INFLIGHT_LOCK:
+                INFLIGHT -= 1
 
 
 def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_map, json_records,
