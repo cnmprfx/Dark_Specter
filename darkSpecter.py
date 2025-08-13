@@ -5,7 +5,7 @@
 #           Verbose/Debug + Live Stats + Optional Headless Rendering (Playwright)
 #           Screenshots via a dedicated render thread (de-duped per URL)
 # Deps:    pip install requests[socks] beautifulsoup4
-# Optional (for --render/--shots):
+# Optional (for --shots):
 #          pip install playwright && playwright install firefox
 
 import argparse, sys, time, random, pathlib, json, os, re, threading, traceback
@@ -258,12 +258,6 @@ class PageLimiter:
             self._count += 1
             return True
 
-    def remaining(self) -> int:
-        with self._lock:
-            if self.max_pages <= 0:
-                return 1_000_000_000
-            return max(0, self.max_pages - self._count)
-
 # ===== Auth & Session helpers =====
 def parse_kv_pairs(pairs):
     out = {}
@@ -475,7 +469,7 @@ def _safe_name(url, depth):
 def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, json_records,
                  max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                  follow_only_if_match, crawl_log, delay, timeout, verify_tls, verbose, save_debug,
-                 stats: CrawlStats, limiter: PageLimiter, stop_evt: threading.Event,
+                 stats: CrawlStats, limiter, stop_evt: threading.Event,
                  render_queue=None, shots=False, shot_mode="matches"):
 
     while not stop_evt.is_set():
@@ -591,10 +585,10 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
 
 def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_map, json_records,
                     max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
-                    follow_only_if_match=False, renderer=None, shots=False, shot_mode="matches",
+                    follow_only_if_match=False, shots=False, shot_mode="matches",
                     shots_dir=None, crawl_log=False, delay=0, timeout=30, verify_tls=True,
                     verbose=False, save_debug=False, max_workers=5, stats_interval=2.0,
-                    max_pages=0):
+                    max_pages=0, render_settings=None):
 
     q = Queue()
     q.put((root_url, 0, None))
@@ -613,16 +607,40 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
         )
         stats_thread.start()
 
-    # Optional render queue/worker (single thread, serial Playwright use)
+    # Optional render queue/worker (create & use Playwright **inside** this thread)
     render_queue = None
     render_thread = None
     SENTINEL = object()
-    if renderer and shots:
+    if shots:
         shots_dir = shots_dir or "screenshots"
         os.makedirs(shots_dir, exist_ok=True)
         render_queue = Queue()
 
         def render_worker():
+            renderer_local = None
+            try:
+                # Build a fresh Renderer in THIS thread only
+                renderer_local = Renderer(
+                    proxy_server=render_settings["proxy_server"],
+                    user_agent=render_settings["user_agent"],
+                    headless=True,
+                    wait_until=render_settings["wait_until"],
+                    timeout_ms=render_settings["timeout_ms"],
+                )
+            except RuntimeError as e:
+                print(f"[render] {e}")
+                print("[render] Rendering disabled (continuing without renderer).")
+                # Drain items so workers don't block forever
+                while True:
+                    try:
+                        item = render_queue.get_nowait()
+                        render_queue.task_done()
+                        if item is SENTINEL:
+                            break
+                    except Empty:
+                        break
+                return
+
             while not stop_evt.is_set():
                 try:
                     item = render_queue.get(timeout=0.5)
@@ -634,13 +652,16 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                 url, depth = item
                 try:
                     ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                    renderer.render(url, screenshot_path=ss_path)
+                    renderer_local.render(url, screenshot_path=ss_path)
                     if verbose:
                         print(f"[shot] saved {ss_path}")
                 except Exception as e:
                     print(f"[shot] EXC {type(e).__name__}: {e} {url}")
                 finally:
                     render_queue.task_done()
+
+            if renderer_local:
+                renderer_local.close()
 
         render_thread = threading.Thread(target=render_worker, daemon=True)
         render_thread.start()
@@ -724,15 +745,13 @@ def main():
     # Per-URL/host Session Map
     p.add_argument("--session-map", help="Path to JSON file with per-URL/host session profiles")
 
-    # Screenshots & Rendering
+    # Screenshots (Playwright used only inside the render thread)
     p.add_argument("--shots", action="store_true",
-                   help="Take screenshots (saved via render thread). Default captures only matched pages.")
+                   help="Take screenshots via a dedicated render thread. Default captures only matched pages.")
     p.add_argument("--shots-dir", default="screenshots",
                    help="Directory to store screenshots (default: screenshots)")
     p.add_argument("--shot-mode", choices=["matches","all"], default="matches",
                    help="Screenshot only matched pages or all visited pages (default: matches)")
-    p.add_argument("--render", action="store_true",
-                   help="Use a headless browser for JS rendering (Playwright via Tor proxy)")
     p.add_argument("--render-timeout", type=int, default=30000,
                    help="Render timeout in ms for page navigation (default: 30000)")
     p.add_argument("--render-wait", choices=["load","domcontentloaded","networkidle"], default="networkidle",
@@ -789,30 +808,21 @@ def main():
     profiles = load_session_map(args.session_map) if args.session_map else []
     session_router = SessionRouter(base_session, profiles, args.socks_host, args.socks_port, args.timeout, verbose=args.verbose)
 
-    # Build matcher & renderer
+    # Build matcher
     matcher = build_matcher(args.phrase, args.regex)
-
-    renderer = None
-    try:
-        if args.render or args.shots:
-            proxy = f"socks5://{args.socks_host}:{args.socks_port}"
-            renderer = Renderer(
-                proxy_server=proxy,
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.6",
-                headless=True,
-                wait_until=args.render_wait,
-                timeout_ms=args.render_timeout
-            )
-    except RuntimeError as e:
-        print(f"[render] {e}")
-        if args.render or args.shots:
-            print("[render] Rendering disabled (continuing without renderer).")
-        renderer = None
 
     out_path = pathlib.Path(args.out)
     visited, matched = set(), set()
     parent_map, json_records = {}, []
     compiled_excludes = compile_exclude_patterns(args.exclude_domains)
+
+    # Render settings (only used inside render thread if --shots)
+    render_settings = {
+        "proxy_server": f"socks5://{args.socks_host}:{args.socks_port}",
+        "user_agent": "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.6",
+        "wait_until": args.render_wait,
+        "timeout_ms": args.render_timeout,
+    }
 
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
@@ -829,7 +839,6 @@ def main():
             allow_subdomains=args.allow_subdomains,
             exclude_patterns=compiled_excludes,
             follow_only_if_match=args.follow_only_if_match,
-            renderer=renderer,
             shots=args.shots,
             shot_mode=args.shot_mode,
             shots_dir=args.shots_dir,
@@ -841,7 +850,8 @@ def main():
             save_debug=args.save_debug,
             max_workers=args.max_workers,
             stats_interval=args.stats_interval,
-            max_pages=args.max_pages
+            max_pages=args.max_pages,
+            render_settings=render_settings
         )
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
@@ -853,9 +863,6 @@ def main():
                 "total_matches": len(matched),
                 "matches": json_records
             }, jf, indent=2, ensure_ascii=False)
-
-    if renderer:
-        renderer.close()
 
     print(f"\nDone. {len(matched)} matches → {out_path}"
           + (f"  |  JSON → {args.json_out}" if args.json else ""))
