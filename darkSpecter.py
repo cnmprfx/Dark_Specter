@@ -362,7 +362,8 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
                     *, verify_tls=True, verbose=False, save_debug=False,
                     renderer=None, shots=False, shots_dir="screenshots",
                     shot_mode="matches", render_for_match=False,
-                    shot_taken=None, follow_only_if_match=False):
+                    shot_taken=None, follow_only_if_match=False,
+                    crawl_log=False):
     if shot_taken is None:
         shot_taken = set()
 
@@ -371,6 +372,10 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
 
     while stack:
         url, depth, parent = stack.pop()
+
+        if crawl_log:
+            print(f"{'  '*depth}[fetch] depth={depth} url={url}")
+
         if url in visited:
             continue
         if total_fetched >= max_pages:
@@ -383,14 +388,14 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
         # pick session based on URL/profile
         session = session_router.session_for(url)
 
-        # 1) Fetch raw HTML via requests (fast, cheap)
+        # 1) Fetch raw HTML via requests
         txt = fetch_text(session, url, timeout,
                          verify_tls=verify_tls,
                          verbose=verbose,
                          save_debug=save_debug)
         total_fetched += 1
 
-        # 2) If rendering is requested for matching, render now (optionally screenshot ALL pages)
+        # 2) Optional rendering for matching; optionally screenshot ALL pages
         if renderer and render_for_match:
             try:
                 ss_path = None
@@ -408,12 +413,12 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
                 if verbose:
                     print(f"[render] EXC {type(e).__name__}: {e} {url}")
 
-        # 3) If not rendering for match but we still want ALL screenshots, grab shot now
         elif renderer and shots and shot_mode == "all" and (url not in shot_taken):
+            # Screenshot ALL pages even if not rendering for match (don’t replace txt)
             try:
                 os.makedirs(shots_dir, exist_ok=True)
                 ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                renderer.render(url, screenshot_path=ss_path)  # ignore returned HTML
+                renderer.render(url, screenshot_path=ss_path)
                 shot_taken.add(url)
                 if verbose:
                     print(f"[shot] saved {ss_path}")
@@ -425,6 +430,7 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
             print(f"{DIM}[fail]{RESET} {url}")
             continue
 
+        # Match / record
         is_match = matcher(txt)
         if is_match:
             matched.add(url)
@@ -448,16 +454,23 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
             elif shots and (shot_mode == "matches") and not renderer and verbose:
                 print("[shot] --shots requested but --render not enabled; enable --render to capture screenshots.")
         else:
+            # Non-matching page (still spider unless --follow-only-if-match)
             print(f"{'  '*depth}[.... ] {url}")
 
         # === Branching rule ===
-        # New default: spider entire app (always enqueue children, within depth/page limits)
-        # Old behavior preserved via --follow-only-if-match
+        # Spider entire app by default; only restrict when --follow-only-if-match is set
         should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
         if should_expand:
-            for link in extract_links(url, txt, allow_offdomain=allow_offdomain):
+            children = extract_links(url, txt, allow_offdomain=allow_offdomain)
+            enq = 0
+            for link in children:
                 if link not in visited:
                     stack.append((link, depth+1, url))
+                    enq += 1
+                    if crawl_log:
+                        print(f"{'  '*(depth+1)}[enqueue] {link}")
+            if crawl_log:
+                print(f"{'  '*depth}[links] extracted={len(children)} enqueued={enq} depth={depth+1}")
 
         time.sleep(delay + random.uniform(0, 0.8))
 
@@ -528,6 +541,8 @@ def main():
                    help="Render timeout in ms for page navigation (default: 30000)")
     p.add_argument("--render-wait", choices=["load","domcontentloaded","networkidle"], default="networkidle",
                    help="Playwright wait_until condition (default: networkidle)")
+    p.add_argument("--crawl-log", action="store_true",
+               help="Show each page fetch and enqueue in real-time")
 
     # Help banner handling
     if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
@@ -623,6 +638,7 @@ def main():
             render_for_match=render_for_match,
             shot_taken=shot_taken,
             follow_only_if_match=args.follow_only_if_match,
+            crawl_log=args.crawl_log,
         )
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
