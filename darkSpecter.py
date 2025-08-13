@@ -223,23 +223,31 @@ class CrawlStats:
                 "elapsed": max(0.001, time.time() - self.start),
             }
 
-def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval: float, use_cr: bool):
+def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval: float, use_cr: bool,
+                   matched_set: set, visited_set: set | None = None):
+    # Print a single line periodically with carriage-return (unless crawl_log is on)
     while not stop_evt.is_set():
         snap = stats.snapshot()
+        qsize = 0
         try:
             qsize = queue.qsize()
         except Exception:
-            qsize = 0
+            pass
+        # Use the ground truth for matched (and optionally visited)
+        matched_count = len(matched_set)
+        visited_count = snap["visited"] if visited_set is None else len(visited_set)
+
         rate = snap["fetched"] / snap["elapsed"]
-        line = (f"[stats] visited={snap['visited']} queued={qsize} matched={snap['matched']} "
+        line = (f"[stats] visited={visited_count} queued={qsize} matched={matched_count} "
                 f"depth={snap['max_depth']} rate={rate:.2f}/s elapsed={int(snap['elapsed'])}s")
         if use_cr:
-            print("\r" + line + " " * 12, end="", flush=True)
+            print("\r" + line + " " * 10, end="", flush=True)
         else:
             print(line, flush=True)
         stop_evt.wait(interval)
     if use_cr:
         print("")
+
 
 # ===== Page limiter (max-pages) =====
 class PageLimiter:
