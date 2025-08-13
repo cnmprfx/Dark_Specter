@@ -25,12 +25,12 @@ PARENT_LOCK = threading.Lock()
 RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
 
 ASCII_BANNER = rf"""
-{RED}  ____             _        {PURPLE}____                  _            
-{RED} |  _ \  __ _ _ __| | __   {PURPLE}/ ___| _ __   ___  ___| |_ ___ _ __ 
+{RED}  ____             _        {PURPLE}____                  _
+{RED} |  _ \  __ _ _ __| | __   {PURPLE}/ ___| _ __   ___  ___| |_ ___ _ __
 {RED} | | | |/ _` | '__| |/ /   {PURPLE}\___ \| '_ \ / _ \/ __| __/ _ \ '__|
-{RED} | |_| | (_| | |  |   <     {PURPLE}___) | |_) |  __/ (__| ||  __/ |   
-{RED} |____/ \__,_|_|  |_|\_\   {PURPLE}|____/| .__/ \___|\___|\__\___|_|   
-{PURPLE}                                 |_|                           
+{RED} | |_| | (_| | |  |   <     {PURPLE}___) | |_) |  __/ (__| ||  __/ |
+{RED} |____/ \__,_|_|  |_|\_\   {PURPLE}|____/| .__/ \___|\___|\__\___|_|
+{PURPLE}                                 |_|
 {RESET}                ==== {RED}Dark {PURPLE}Spectre{RESET} - Tor Keyword Hunter ====
 """
 
@@ -128,7 +128,7 @@ def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug
             print(f"[http] EXC {type(e).__name__}: {e} {url}")
         return None
 
-PLAIN_URL_RE = re.compile(r'\bhttps?://[^\s"\'<>)]+', re.IGNORECASE)
+PLAIN_URL_RE = re.compile(r'\bhttps?://[^\s"\'<>]+', re.IGNORECASE)
 def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False, exclude_patterns=None):
     exclude_patterns = exclude_patterns or []
     try:
@@ -398,7 +398,7 @@ def make_session_from_profile(base_session, prof, socks_host, socks_port, timeou
             extra_fields=None,
             csrf_selector=auth.get("csrf_selector"),
             csrf_attr=auth.get("csrf_attr") or "value",
-            timeout=timeout,
+            timeout=auth.get("timeout"),
             success_regex=auth.get("success_regex"),
         )
     return s
@@ -488,7 +488,6 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             # de-dupe / mark visited early
             with VISITED_LOCK:
                 if url in visited:
-                    queue.task_done()
                     continue
                 visited.add(url)
             stats.on_visit(depth)
@@ -505,7 +504,6 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             if not limiter.allow_fetch():
                 if crawl_log:
                     print(f"{DIM}[limit]{RESET} max-pages reached, skipping fetch")
-                queue.task_done()
                 continue
 
             # Pick session based on URL/profile
@@ -521,7 +519,6 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             if not txt:
                 if crawl_log:
                     print(f"{DIM}[fail]{RESET} {url}")
-                queue.task_done()
                 continue
 
             # Match check
@@ -577,6 +574,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             traceback.print_exc()
         finally:
             try:
+                # Mark queue item done exactly once for all code paths
                 queue.task_done()
             except Exception:
                 pass
