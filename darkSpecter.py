@@ -527,7 +527,6 @@ def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_off
                             url, txt,
                             allow_offdomain=allow_offdomain,
                             allow_subdomains=allow_subdomains,
-                            exclude_domains=exclude_domains
                             )
 
             enq = 0
