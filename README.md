@@ -1,6 +1,6 @@
  
        
-                ==== Dark Spectre - Tor Keyword Hunter ====
+                ==== Dark Specter - Tor Keyword Hunter ====
 
 
 
