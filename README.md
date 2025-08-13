@@ -39,7 +39,7 @@
 
 ```bash
 # Clone repo
-git clone https://github.com/yourusername/dark-spectre.git
+git clone https://github.com/yourusername/dark-specter.git
 cd dark-specter
 
 # Install dependencies
