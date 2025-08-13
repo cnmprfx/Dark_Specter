@@ -1,25 +1,21 @@
----
 
 
 # Dark Spectre - Tor Keyword Hunter
 
-```
 
----
 
-\|  \_ \  \_\_ \_ \_ \_\_| | \_\_   / ***| \_ \_\_   \_\_\_  ***| |* \_\_\_ \_ \_\_
-\| | | |/ \_\` | '**| |/ /   \_** | '* \ / \_ / **| **/ \_ \ '**|
-\| |*| | (*| | |  |   <     ***) | |*) |  **/ (**| ||  **/ |
-|****/ \_*,*|*|  |*|\_\   |\_\_\_\_/| .**/ \_**|\_**|\_\_\_**|*|
-|*|
-\==== Dark Spectre - Tor Keyword Hunter ====
 
-````
+
+
+
+==== Dark Spectre - Tor Keyword Hunter ====
+
+
 
 Dark Spectre is a **multi-threaded darknet & clearnet crawler** designed for OSINT and investigative keyword hunting.  
 It supports **Tor**, **authentication**, **recursive spidering**, **screenshots**, **domain exclusion**, and **live crawl stats**.
 
----
+
 
 ## Features
 
@@ -33,21 +29,21 @@ It supports **Tor**, **authentication**, **recursive spidering**, **screenshots*
 - **Live crawl stats** (`--stats-interval`)
 - **Max pages limit** (`--max-pages`)
 
----
+
 
 ## Requirements
 
-```bash
+bash
 pip install requests beautifulsoup4 playwright
 playwright install chromium
-````
+
 
 If crawling `.onion` sites:
 
-```bash
+bash
 sudo apt install tor
 systemctl start tor
-```
+
 
 Run with:
 
@@ -55,9 +51,10 @@ Run with:
 torsocks python3 darkSpectre.py ...
 ```
 
+
 or configure your HTTP/SOCKS proxy in the script/session router.
 
----
+
 
 ## Usage
 
@@ -91,7 +88,7 @@ python3 darkSpectre.py urls.txt "Interlock" \
 | `--exclude-domains PATTERN [PATTERN...]` | Regex or plain text domains to skip                                      |                                      |
 | `--follow-only-if-match`                 | Only follow links from matched pages                                     |                                      |
 | `--shots`                                | Capture screenshots                                                      |                                      |
-| \`--shot-mode matches                    | all\`                                                                    | Screenshot only matches or all pages |
+| `--shot-mode matches`                    | all                                                                      | Screenshot only matches or all pages |
 | `--shots-dir DIR`                        | Directory to save screenshots                                            |                                      |
 | `--render`                               | Use headless browser rendering (needed for JS-heavy sites & screenshots) |                                      |
 | `--auth-file FILE`                       | JSON with per-URL auth/session cookies                                   |                                      |
