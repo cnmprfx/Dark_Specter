@@ -122,7 +122,7 @@ def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug
             print(f"[http] EXC {type(e).__name__}: {e} {url}")
         return None
 
-PLAIN_URL_RE = _re.compile(r'\bhttps?://[^\s"\'<>)]+', _re.IGNORECASE)
+PLAIN_URL_RE = re.compile(r'\bhttps?://[^\s"\'<>)]+', re.IGNORECASE)
 def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False, exclude_patterns=None):
     if exclude_patterns is None:
         exclude_patterns = []
