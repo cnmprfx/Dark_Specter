@@ -20,7 +20,7 @@ It supports **Tor**, **authentication**, **recursive spidering**, **screenshots*
 ## Features
 
 - **Parallel spidering** with `--max-workers`
-- **Tor-ready** (use with `torsocks` or a Tor proxy)
+- **Tor-ready** (use with `torsocks`,Tor daemon, or a Tor proxy)
 - **Keyword / regex matching** with optional `--follow-only-if-match`
 - **Recursive depth control** (`--max-depth`)
 - **Auth per URL** via session data
