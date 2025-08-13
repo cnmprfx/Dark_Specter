@@ -233,8 +233,13 @@ def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval
             qsize = queue.qsize()
         except Exception:
             pass
+        if qsize == 0:
+            with INFLIGHT_LOCK:
+                if INFLIGHT == 0:
+                    stop_evt.set()
+                    break    
         # Use the ground truth for matched (and optionally visited)
-        matched_count = len(matched_set)
+        matched_count = len(matched_set or [])
         visited_count = snap["visited"] if visited_set is None else len(visited_set)
 
         rate = snap["fetched"] / snap["elapsed"]
@@ -608,7 +613,7 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
     if stats_interval and stats_interval > 0:
         stats_thread = threading.Thread(
             target=_stats_printer,
-            args=(q, stats, stop_evt, float(stats_interval), not crawl_log),
+            args=(q, stats, stop_evt, float(stats_interval), not crawl_log, matched, visited),
             daemon=True,
         )
         stats_thread.start()
@@ -683,8 +688,9 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
             )
         q.join()
 
-    # Signal shutdown for stats + render threads
-    stop_evt.set()
+    # Queue drained: signal workers/stats thread to exit
+        stop_evt.set()
+   # Signal shutdown for stats + render threads
     if render_queue:
         render_queue.put(SENTINEL)
         render_queue.join()
