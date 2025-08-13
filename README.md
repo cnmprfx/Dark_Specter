@@ -1,6 +1,6 @@
 
 
-# Dark Spectre - Tor Keyword Hunter
+# Dark Specter - Tor Keyword Hunter
 
 
 
@@ -8,7 +8,7 @@
 
 
 
-==== Dark Spectre - Tor Keyword Hunter ====
+==== Dark Specter - Tor Keyword Hunter ====
 
 
 
@@ -48,7 +48,7 @@ systemctl start tor
 Run with:
 
 ```bash
-torsocks python3 darkSpectre.py ...
+torsocks python3 darkSpecter.py ...
 ```
 
 
@@ -59,13 +59,13 @@ or configure your HTTP/SOCKS proxy in the script/session router.
 ## Usage
 
 ```bash
-python3 darkSpectre.py URLS_FILE "KEYWORD" [OPTIONS]
+python3 darkSpecter.py URLS_FILE "KEYWORD" [OPTIONS]
 ```
 
 **Example:**
 
 ```bash
-python3 darkSpectre.py urls.txt "Interlock" \
+python3 darkSpecter.py urls.txt "Interlock" \
     --max-depth 5 --max-workers 10 \
     --shots --shot-mode matches --shots-dir shots \
     --exclude-domains ".*bitcoin.*" badsite.onion \
@@ -147,7 +147,7 @@ Requires `--render` and `playwright` installed.
 Example:
 
 ```bash
-python3 darkSpectre.py urls.txt "keyword" \
+python3 darkSpecter.py urls.txt "keyword" \
     --shots --shot-mode matches --shots-dir ./shots --render
 ```
 
@@ -170,7 +170,7 @@ Supports regex patterns and exact matches.
 
 ## Parallel Crawler + Max Pages
 
-Dark Spectre uses a **thread-safe limiter** to stop all workers once `--max-pages` is reached.
+Dark Specter uses a **thread-safe limiter** to stop all workers once `--max-pages` is reached.
 Workers stop enqueuing new links after the limit.
 
 
