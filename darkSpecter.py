@@ -69,7 +69,7 @@ def is_excluded(url, compiled_patterns):
 
 def same_domain(u1, u2):
     def _host(h):
-    return (h or "").lower().strip()
+        return (h or "").lower().strip()
 
 def _strip_www(h):
     h = _host(h)
