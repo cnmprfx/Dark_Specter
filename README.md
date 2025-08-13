@@ -12,9 +12,9 @@
 
 
 
-# 🕵️‍♂️ Dark Spectre - Tor Keyword Hunter
+# 🕵️‍♂️ Dark Specter - Tor Keyword Hunter
 
-**Dark Spectre** is a high-performance, multithreaded crawler for the Tor/Darknet and regular web, designed to search for specific words or phrases, capture screenshots, and optionally authenticate to sites that require login. It is optimized for OPSEC, large-scale scraping, and investigative workflows.
+**Dark Specter** is a high-performance, multithreaded crawler for the Tor/Darknet and regular web, designed to search for specific words or phrases, capture screenshots, and optionally authenticate to sites that require login. It is optimized for OPSEC, large-scale scraping, and investigative workflows.
 
 ---
 
@@ -40,7 +40,7 @@
 ```bash
 # Clone repo
 git clone https://github.com/yourusername/dark-spectre.git
-cd dark-spectre
+cd dark-specter
 
 # Install dependencies
 pip install -r requirements.txt
@@ -76,7 +76,7 @@ python3 darkSpecter.py URLS_FILE "KEYWORD" [OPTIONS]
 **Example:**
 
 ```bash
-python3 darkSpecter.py urls.txt "Interlock" \
+python3 darkSpecter.py urls.txt "Keyword/Phrase" \
     --max-depth 5 --max-workers 10 \
     --shots --shot-mode matches --shots-dir shots \
     --exclude-domains ".*bitcoin.*" badsite.onion \
@@ -115,7 +115,7 @@ python3 darkSpecter.py urls.txt "Interlock" \
 
 ## Live Stats Output
 
-When `--stats-interval` > 0, Dark Spectre will print:
+When `--stats-interval` > 0, Dark Specter will print:
 
 ```
 [stats] visited=38 queued=21 matched=5 depth=4 rate=0.78/s elapsed=49s
