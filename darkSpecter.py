@@ -228,11 +228,21 @@ def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval
     # Print a single line periodically with carriage-return (unless crawl_log is on)
     while not stop_evt.is_set():
         snap = stats.snapshot()
+        
+        # Display queue size but rely on unfinished_tasks to decide completion
         qsize = 0
         try:
             qsize = queue.qsize()
+            pending = queue.unfinished_tasks
         except Exception:
             pass
+            pending = 0
+
+        if pending == 0:
+            with INFLIGHT_LOCK:
+                if INFLIGHT == 0:
+                    stop_evt.set()
+                    break
         if qsize == 0:
             with INFLIGHT_LOCK:
                 if INFLIGHT == 0:
