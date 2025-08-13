@@ -424,53 +424,95 @@ def _safe_name(url, depth):
     return f"d{depth}_{ts}_{base[:120]}.png"
 
 # ===== Crawl =====
-def crawl_worker(queue, session, matcher, matched, visited, parent_map, json_records,
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+
+def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, json_records,
                  max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
-                 take_screenshots, screenshot_dir, crawl_log, delay, timeout, verify_tls):
+                 follow_only_if_match, renderer, shots, shot_mode, shots_dir,
+                 crawl_log, delay, timeout, verify_tls, verbose, save_debug):
+
+    shot_taken = set()
+
     while True:
         try:
             url, depth, parent = queue.get(timeout=1)
         except:
-            return  # Queue empty
+            return  # queue empty
 
         if url in visited:
             queue.task_done()
             continue
 
         visited.add(url)
-        if crawl_log:
-            print(f"{'  '*depth}[fetch] {url}")
+        if parent and url not in parent_map:
+            parent_map[url] = parent
 
-        txt = fetch_url(session, url, timeout=timeout, verify_tls=verify_tls)
+        if crawl_log:
+            print(f"{'  '*depth}[fetch] depth={depth} url={url}")
+
+        # Pick session based on URL/profile
+        session = session_router.session_for(url)
+
+        # Fetch HTML
+        txt = fetch_text(session, url, timeout,
+                         verify_tls=verify_tls,
+                         verbose=verbose,
+                         save_debug=save_debug)
+
         if not txt:
             if crawl_log:
-                print(f"{'  '*depth}[fail] {url}")
+                print(f"{DIM}[fail]{RESET} {url}")
             queue.task_done()
             continue
 
-        # Save screenshot if requested
-        if take_screenshots:
+        # Renderer + optional screenshots
+        if renderer and shots and shot_mode == "all" and (url not in shot_taken):
             try:
-                save_screenshot(url, screenshot_dir)
+                os.makedirs(shots_dir, exist_ok=True)
+                ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                renderer.render(url, screenshot_path=ss_path)
+                shot_taken.add(url)
+                if verbose:
+                    print(f"[shot] saved {ss_path}")
             except Exception as e:
-                if crawl_log:
-                    print(f"{'  '*depth}[screenshot fail] {url} ({e})")
+                if verbose:
+                    print(f"[shot] EXC {type(e).__name__}: {e} {url}")
 
         # Match check
-        if matcher(txt):
+        is_match = matcher(txt)
+        if is_match:
             matched.add(url)
             print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
             json_records.append({
                 "url": url, "depth": depth, "parent": parent,
                 "chain": chain_for(url, parent_map)
             })
+            # Screenshot on match (matches mode)
+            if shots and shot_mode == "matches" and renderer and (url not in shot_taken):
+                try:
+                    os.makedirs(shots_dir, exist_ok=True)
+                    ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                    renderer.render(url, screenshot_path=ss_path)
+                    shot_taken.add(url)
+                    if verbose:
+                        print(f"[shot] saved {ss_path}")
+                except Exception as e:
+                    if verbose:
+                        print(f"[shot] EXC {type(e).__name__}: {e} {url}")
 
-        # Recurse if depth limit not reached
-        if depth < max_depth:
-            children = extract_links(url, txt,
-                                     allow_offdomain=allow_offdomain,
-                                     allow_subdomains=allow_subdomains,
-                                     exclude_patterns=exclude_patterns)
+        elif crawl_log:
+            print(f"{'  '*depth}[....] {url}")
+
+        # Spider children
+        should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
+        if should_expand:
+            children = extract_links(
+                url, txt,
+                allow_offdomain=allow_offdomain,
+                allow_subdomains=allow_subdomains,
+                exclude_patterns=exclude_patterns
+            )
             enq = 0
             for link in children:
                 if link not in visited:
@@ -484,148 +526,28 @@ def crawl_worker(queue, session, matcher, matched, visited, parent_map, json_rec
 
         queue.task_done()
         if delay > 0:
-            time.sleep(delay)
+            time.sleep(delay + random.uniform(0, 0.8))
 
-def crawl_recursive(session_router, root_url, matcher, timeout, delay, allow_offdomain,
-                    max_depth, max_pages, visited, matched, parent_map, json_records,
-                    *, verify_tls=True, verbose=False, save_debug=False,
-                    renderer=None, shots=False, shots_dir="screenshots",
-                    shot_mode="matches", render_for_match=False,
-                    shot_taken=None, follow_only_if_match=False,
-                    crawl_log=False, allow_subdomains=False,exclude_patterns=None,delay=0, timeout=30, verify_tls=True, max_workers=5):
+
+def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_map, json_records,
+                    max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
+                    follow_only_if_match=False, renderer=None, shots=False, shot_mode="matches",
+                    shots_dir=None, crawl_log=False, delay=0, timeout=30, verify_tls=True,
+                    verbose=False, save_debug=False, max_workers=5):
 
     queue = Queue()
     queue.put((root_url, 0, None))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
         for _ in range(max_workers):
-            futures.append(executor.submit(
-                crawl_worker, queue, session, matcher, matched, visited, parent_map, json_records,
+            executor.submit(
+                crawl_worker, queue, session_router, matcher, matched, visited, parent_map, json_records,
                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
-                take_screenshots, screenshot_dir, crawl_log, delay, timeout, verify_tls
-            ))
-        # Wait for queue to empty
+                follow_only_if_match, renderer, shots, shot_mode, shots_dir,
+                crawl_log, delay, timeout, verify_tls, verbose, save_debug
+            )
         queue.join()
-        # Cancel workers
-        for f in futures:
-            f.cancel()
-    
-    if shot_taken is None:
-        shot_taken = set()
 
-    stack = deque([(root_url, 0, None)])
-    total_fetched = 0
-
-    while stack:
-        url, depth, parent = stack.pop()
-
-        if crawl_log:
-            print(f"{'  '*depth}[fetch] depth={depth} url={url}")
-
-        if url in visited:
-            continue
-        if total_fetched >= max_pages:
-            print(f"{DIM}[limit]{RESET} max-pages reached"); break
-
-        visited.add(url)
-        if parent and url not in parent_map:
-            parent_map[url] = parent
-
-        # pick session based on URL/profile
-        session = session_router.session_for(url)
-
-        # 1) Fetch raw HTML via requests
-        txt = fetch_text(session, url, timeout,
-                         verify_tls=verify_tls,
-                         verbose=verbose,
-                         save_debug=save_debug)
-        total_fetched += 1
-
-        # 2) Optional rendering for matching; optionally screenshot ALL pages
-        if renderer and render_for_match:
-            try:
-                ss_path = None
-                if shots and shot_mode == "all" and (url not in shot_taken):
-                    os.makedirs(shots_dir, exist_ok=True)
-                    ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                txt = renderer.render(url, screenshot_path=ss_path)
-                if ss_path:
-                    shot_taken.add(url)
-                    if verbose:
-                        print(f"[shot] saved {ss_path}")
-                elif verbose:
-                    print(f"[render] {url} -> no-shot")
-            except Exception as e:
-                if verbose:
-                    print(f"[render] EXC {type(e).__name__}: {e} {url}")
-
-        elif renderer and shots and shot_mode == "all" and (url not in shot_taken):
-            # Screenshot ALL pages even if not rendering for match (don’t replace txt)
-            try:
-                os.makedirs(shots_dir, exist_ok=True)
-                ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                renderer.render(url, screenshot_path=ss_path)
-                shot_taken.add(url)
-                if verbose:
-                    print(f"[shot] saved {ss_path}")
-            except Exception as e:
-                if verbose:
-                    print(f"[shot] EXC {type(e).__name__}: {e} {url}")
-
-        if not txt:
-            print(f"{DIM}[fail]{RESET} {url}")
-            continue
-
-        # Match / record
-        is_match = matcher(txt)
-        if is_match:
-            matched.add(url)
-            print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
-            json_records.append({
-                "url": url, "depth": depth, "parent": parent,
-                "chain": chain_for(url, parent_map)
-            })
-            # Screenshot on match (if not already shot in ALL mode)
-            if shots and (shot_mode == "matches") and renderer and (url not in shot_taken):
-                try:
-                    os.makedirs(shots_dir, exist_ok=True)
-                    ss_path = os.path.join(shots_dir, _safe_name(url, depth))
-                    renderer.render(url, screenshot_path=ss_path)
-                    shot_taken.add(url)
-                    if verbose:
-                        print(f"[shot] saved {ss_path}")
-                except Exception as e:
-                    if verbose:
-                        print(f"[shot] EXC {type(e).__name__}: {e} {url}")
-            elif shots and (shot_mode == "matches") and not renderer and verbose:
-                print("[shot] --shots requested but --render not enabled; enable --render to capture screenshots.")
-        else:
-            # Non-matching page (still spider unless --follow-only-if-match)
-            print(f"{'  '*depth}[.... ] {url}")
-
-        # === Branching rule ===
-        # Spider entire app by default; only restrict when --follow-only-if-match is set
-        should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
-        if should_expand:
-            children = extract_links(
-                            url, txt,
-                            allow_offdomain=allow_offdomain,
-                            allow_subdomains=allow_subdomains,
-                            exclude_patterns=exclude_patterns,
-                            )
-
-            enq = 0
-            for link in children:
-                if link not in visited:
-                    stack.append((link, depth+1, url))
-                    enq += 1
-                    if crawl_log:
-                        print(f"{'  '*(depth+1)}[enqueue] {link}")
-            if crawl_log:
-                print(f"{'  '*depth}[links] extracted={len(children)} enqueued={enq} depth={depth+1}")
-
-        time.sleep(delay + random.uniform(0, 0.8))
 
 # ===== Main =====
 def main():
@@ -705,6 +627,7 @@ def main():
 
 
 
+
     # Help banner handling
     if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
         p.print_help(); sys.exit(0)
@@ -777,7 +700,7 @@ def main():
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
         crawl_recursive(
-            session=session,
+            session_router=session_router,
             root_url=seed,
             matcher=matcher,
             matched=matched,
@@ -788,14 +711,20 @@ def main():
             allow_offdomain=args.allow_offdomain,
             allow_subdomains=args.allow_subdomains,
             exclude_patterns=compiled_excludes,
-            take_screenshots=args.screenshots,
-            screenshot_dir=args.screenshot_dir,
+            follow_only_if_match=args.follow_only_if_match,
+            renderer=renderer,
+            shots=args.shots,
+            shot_mode=args.shot_mode,
+            shots_dir=args.screenshot_dir,
             crawl_log=args.crawl_log,
             delay=args.delay,
             timeout=args.timeout,
             verify_tls=not args.no_verify,
+            verbose=args.verbose,
+            save_debug=args.save_debug,
             max_workers=args.max_workers
-        )
+            )
+
 
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
