@@ -1,6 +1,13 @@
+  ____             _        ____                  _            
+ |  _ \  __ _ _ __| | __   / ___| _ __   ___  ___| |_ ___ _ __ 
+ | | | |/ _` | '__| |/ /   \___ \| '_ \ / _ \/ __| __/ _ \ '__|
+ | |_| | (_| | |  |   <     ___) | |_) |  __/ (__| ||  __/ |   
+ |____/ \__,_|_|  |_|\_\   |____/| .__/ \___|\___|\__\___|_|   
+                                 |_|                           
+                ==== Dark Spectre - Tor Keyword Hunter ====
 
 
-# Dark Specter - Tor Keyword Hunter
+
 
 <img width="468" height="626" alt="image" src="https://github.com/user-attachments/assets/7c278df5-efb4-40ba-83ff-3e06e2e64979" />
 
@@ -9,36 +16,42 @@
 
 
 
-==== Dark Specter - Tor Keyword Hunter ====
+# 🕵️‍♂️ Dark Spectre - Tor Keyword Hunter
 
+**Dark Spectre** is a high-performance, multithreaded crawler for the Tor/Darknet and regular web, designed to search for specific words or phrases, capture screenshots, and optionally authenticate to sites that require login. It is optimized for OPSEC, large-scale scraping, and investigative workflows.
 
+---
 
-Dark Specter is a **multi-threaded darknet & clearnet crawler** designed for OSINT and investigative keyword hunting.  
-It supports **Tor**, **authentication**, **recursive spidering**, **screenshots**, **domain exclusion**, and **live crawl stats**.
+## 🚀 Features
 
+- **Recursive Spidering** – Crawl entire onion or clearnet sites up to a specified depth
+- **Regex or Simple Match** – Match exact phrases or full regex patterns
+- **Auth Support** – Supply session cookies or credentials per URL
+- **Live Stats** – Real-time `visited / queued / matched / depth / rate / elapsed` output
+- **Domain Exclusion** – Skip specific domains or patterns (supports regex)
+- **Multithreaded Crawling** – Adjustable `--max-workers` for speed
+- **Screenshot & Rendering** – Capture matches or all visited pages
+- **Safe Screenshot Threading** – Dedicated main-thread render worker to avoid Playwright thread errors
+- **Onion & Clearnet** – Works via Tor (SOCKS5 proxy) or standard HTTP/S
+- **Debug Logging** – Save HTML source of visited pages
+- **Depth & Scope Control** – Restrict or expand spidering
+- **OPSEC-Friendly** – Adjustable delays, timeouts, and randomized sleep
 
+---
 
-## Features
+## ⚙️ Installation
 
-- **Parallel spidering** with `--max-workers`
-- **Tor-ready** (use with `torsocks`,Tor daemon, or a Tor proxy)
-- **Keyword / regex matching** with optional `--follow-only-if-match`
-- **Recursive depth control** (`--max-depth`)
-- **Auth per URL** via session data
-- **Screenshots** of matches or all pages (`--shots`, `--shot-mode`)
-- **Exclude specific domains** (`--exclude-domains`)
-- **Live crawl stats** (`--stats-interval`)
-- **Max pages limit** (`--max-pages`)
+```bash
+# Clone repo
+git clone https://github.com/yourusername/dark-spectre.git
+cd dark-spectre
 
+# Install dependencies
+pip install -r requirements.txt
 
+# Install Playwright browsers (for screenshots)
+playwright install
 
-## Requirements
-```
-bash
-pip install requests beautifulsoup4 playwright
-playwright install chromium
-
-```
 
 If crawling `.onion` sites:
 ```
