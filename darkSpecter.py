@@ -454,7 +454,7 @@ def _safe_name(url, depth):
 def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, json_records,
                  max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                  follow_only_if_match, renderer, shots, shot_mode, shots_dir,
-                 crawl_log, delay, timeout, verify_tls, verbose, save_debug,
+                 crawl_log, delay, timeout, verify_tls, verbose, save_debug,render_queue=None,
                  stats: CrawlStats, limiter: "PageLimiter", stop_evt: threading.Event):
 
     shot_taken = set()
@@ -505,41 +505,71 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                 continue
 
             # renderer + optional screenshots (ALL mode)
-            if renderer and shots and shot_mode == "all" and (url not in shot_taken):
-                try:
+ # 2) Optional rendering for matching; optionally screenshot ALL pages
+
+        if renderer and render_for_match:
+             try:
+                 ss_path = None
+                 if shots and shot_mode == "all" and (url not in shot_taken):
+
+                    if render_queue:
+                        render_queue.put((url, depth))
+                    else:
+                        os.makedirs(shots_dir, exist_ok=True)
+                        ss_path = os.path.join(shots_dir, _safe_name(url, depth))
+                        txt = renderer.render(url, screenshot_path=ss_path)
+                        if ss_path:
+                            shot_taken.add(url)
+                            if verbose:
+                                print(f"[shot] saved {ss_path}")
+                        elif verbose:
+                            print(f"[render] {url} -> no-shot")
+                else:
+                    txt = renderer.render(url)
+             except Exception as e:
+                 if verbose:
+                     print(f"[render] EXC {type(e).__name__}: {e} {url}")
+ 
+         elif renderer and shots and shot_mode == "all" and (url not in shot_taken):
+             # Screenshot ALL pages even if not rendering for match (don’t replace txt)
+             try:
+                 if render_queue:
+                    render_queue.put((url, depth))
+                else:
                     os.makedirs(shots_dir, exist_ok=True)
                     ss_path = os.path.join(shots_dir, _safe_name(url, depth))
                     renderer.render(url, screenshot_path=ss_path)
                     shot_taken.add(url)
                     if verbose:
                         print(f"[shot] saved {ss_path}")
-                except Exception as e:
-                    if verbose:
-                        print(f"[shot] EXC {type(e).__name__}: {e} {url}")
+             except Exception as e:
+                 if verbose:
+                     print(f"[shot] EXC {type(e).__name__}: {e} {url}")
 
-            # match check
-            is_match = matcher(txt)
-            if is_match:
-                with MATCHED_LOCK:
-                    matched.add(url)
-                stats.on_match()
-                print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
-                json_records.append({
-                    "url": url, "depth": depth, "parent": parent,
-                    "chain": chain_for(url, parent_map)
-                })
-                # screenshot on match (matches mode)
-                if shots and shot_mode == "matches" and renderer and (url not in shot_taken):
-                    try:
+         # Match / record
+         is_match = matcher(txt)
+         if is_match:
+             matched.add(url)
+             print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
+             json_records.append({
+                 "url": url, "depth": depth, "parent": parent,
+                 "chain": chain_for(url, parent_map)
+             })
+             # Screenshot on match (if not already shot in ALL mode)
+             if shots and (shot_mode == "matches") and renderer and (url not in shot_taken):
+                 try:
+                     if render_queue:
+                        render_queue.put((url, depth))
+                    else:
                         os.makedirs(shots_dir, exist_ok=True)
                         ss_path = os.path.join(shots_dir, _safe_name(url, depth))
                         renderer.render(url, screenshot_path=ss_path)
                         shot_taken.add(url)
                         if verbose:
                             print(f"[shot] saved {ss_path}")
-                    except Exception as e:
-                        if verbose:
-                            print(f"[shot] EXC {type(e).__name__}: {e} {url}")
+                 except Exception as e:
+                     if verbose:
+                         print(f"[shot] EXC {type(e).__name__}: {e} {url}")
             elif crawl_log:
                 print(f"{'  '*depth}[....] {url}")
 
@@ -607,12 +637,14 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for _ in range(max_workers):
             executor.submit(
-                crawl_worker, q, session_router, matcher, matched, visited, parent_map, json_records,
-                max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
-                follow_only_if_match, renderer, shots, shot_mode, shots_dir,
-                crawl_log, delay, timeout, verify_tls, verbose, save_debug,
-                stats, limiter, stop_evt
+                crawl_worker,
+                queue, session_router, matcher, matched, visited, parent_map, json_records,
+                args.max_depth, args.allow_offdomain, args.allow_subdomains, args.exclude_domains,
+                args.follow_only_if_match, renderer, args.shots, args.shot_mode, args.shots_dir,
+                args.crawl_log, args.delay, args.timeout, not args.no_verify, args.verbose, args.save_debug,
+                render_queue  # <-- new
             )
+
         # Wait for all tasks to complete
         q.join()
         # IMPORTANT: signal workers to stop BEFORE leaving the executor context
@@ -742,6 +774,34 @@ def main():
                               success_regex=args.success_regex)
             if not ok:
                 print(f"{DIM}[auth]{RESET} form auth failed (continuing without guaranteed session)")
+# Create render queue if screenshots are enabled
+    render_queue = None
+    if args.shots and args.render:
+        from queue import Queue
+        render_queue = Queue()
+
+        def render_worker():
+            while True:
+                try:
+                    url, depth = render_queue.get(timeout=2)
+                except:
+                    if crawl_done.is_set():
+                        break
+                    continue
+                try:
+                    os.makedirs(args.shots_dir, exist_ok=True)
+                    ss_path = os.path.join(args.shots_dir, _safe_name(url, depth))
+                    renderer.render(url, screenshot_path=ss_path)
+                    shot_taken.add(url)
+                    if args.verbose:
+                        print(f"[shot] saved {ss_path}")
+                except Exception as e:
+                    print(f"[shot] EXC {e} {url}")
+                finally:
+                    render_queue.task_done()
+
+        crawl_done = threading.Event()
+        threading.Thread(target=render_worker, daemon=True).start()
 
     # Load per-URL/host session profiles and router
     profiles = load_session_map(args.session_map) if args.session_map else []
