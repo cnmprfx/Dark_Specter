@@ -7,7 +7,8 @@
 # Optional (for --render/--shots):
 #          pip install playwright && playwright install firefox
 
-import argparse, sys, time, random, pathlib, re, json, os
++import argparse, sys, time, random, pathlib,json, os
++import threading
 import requests
 from urllib.parse import urljoin, urlparse
 from collections import deque
@@ -191,6 +192,57 @@ def chain_for(url, parent_map):
     chain.reverse()
     return chain
 
+# ===== Live stats =====
+class CrawlStats:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.start = time.time()
+        self.visited = 0
+        self.matched = 0
+        self.max_depth = 0
+        self.fetched = 0
+
+    def on_fetch(self, depth):
+        with self.lock:
+            self.visited += 1
+            self.fetched += 1
+            if depth > self.max_depth:
+                self.max_depth = depth
+
+    def on_match(self):
+        with self.lock:
+            self.matched += 1
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "visited": self.visited,
+                "matched": self.matched,
+                "max_depth": self.max_depth,
+                "fetched": self.fetched,
+                "elapsed": max(0.001, time.time() - self.start),
+            }
+
+def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval: float, use_cr: bool):
+    # Print a single line periodically with carriage-return (unless crawl_log is on)
+    while not stop_evt.is_set():
+        snap = stats.snapshot()
+        qsize = 0
+        try:
+            qsize = queue.qsize()
+        except Exception:
+            pass
+        rate = snap["fetched"] / snap["elapsed"]
+        line = (f"[stats] visited={snap['visited']} queued={qsize} matched={snap['matched']} "
+                f"depth={snap['max_depth']} rate={rate:.2f}/s elapsed={int(snap['elapsed'])}s")
+        if use_cr:
+            print("\r" + line + " " * 10, end="", flush=True)
+        else:
+            print(line, flush=True)
+        stop_evt.wait(interval)
+    # Final newline if we were using carriage returns
+    if use_cr:
+        print("")
 # ===== Auth & Session helpers =====
 def parse_kv_pairs(pairs):
     out = {}
@@ -428,9 +480,9 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 
 def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, json_records,
-                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
+                max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                  follow_only_if_match, renderer, shots, shot_mode, shots_dir,
-                 crawl_log, delay, timeout, verify_tls, verbose, save_debug):
+                 crawl_log, delay, timeout, verify_tls, verbose, save_debug, stats: CrawlStats):
 
     shot_taken = set()
 
@@ -459,6 +511,8 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                          verify_tls=verify_tls,
                          verbose=verbose,
                          save_debug=save_debug)
+        # Count after attempt (only once per URL)
+        stats.on_fetch(depth)
 
         if not txt:
             if crawl_log:
@@ -484,6 +538,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
         if is_match:
             matched.add(url)
             print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
+            stats.on_match()
             json_records.append({
                 "url": url, "depth": depth, "parent": parent,
                 "chain": chain_for(url, parent_map)
@@ -533,10 +588,22 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                     max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                     follow_only_if_match=False, renderer=None, shots=False, shot_mode="matches",
                     shots_dir=None, crawl_log=False, delay=0, timeout=30, verify_tls=True,
-                    verbose=False, save_debug=False, max_workers=5):
+                    verbose=False, save_debug=False, max_workers=5, stats_interval=2.0):
 
     queue = Queue()
     queue.put((root_url, 0, None))
+
+    stats = CrawlStats()
+    stop_evt = threading.Event()
+    stats_thread = None
+    # Use carriage-return single line only when crawl_log is off (to avoid mixing)
+    if stats_interval and stats_interval > 0:
+        stats_thread = threading.Thread(
+            target=_stats_printer,
+            args=(queue, stats, stop_evt, float(stats_interval), not crawl_log),
+            daemon=True,
+        )
+        stats_thread.start()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for _ in range(max_workers):
@@ -544,10 +611,14 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                 crawl_worker, queue, session_router, matcher, matched, visited, parent_map, json_records,
                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                 follow_only_if_match, renderer, shots, shot_mode, shots_dir,
-                crawl_log, delay, timeout, verify_tls, verbose, save_debug
+                crawl_log, delay, timeout, verify_tls, verbose, save_debug, stats
             )
         queue.join()
-
+        # Stop stats thread
+    if stats_interval and stats_interval > 0:
+        stop_evt.set()
+        if stats_thread:
+            stats_thread.join(timeout=1.0)
 
 # ===== Main =====
 def main():
@@ -624,6 +695,8 @@ def main():
                help="Space-separated list of domains to skip (supports regex, e.g., '.*bitcoin.*' badsite.onion)")
     p.add_argument("--max-workers", type=int, default=5,
                help="Max concurrent fetches (workers) to run in parallel")
+    p.add_argument("--stats-interval", type=float, default=2.0,
+               help="Seconds between live stats updates (0 to disable)")
 
 
 
@@ -722,7 +795,8 @@ def main():
             verify_tls=not args.no_verify,
             verbose=args.verbose,
             save_debug=args.save_debug,
-            max_workers=args.max_workers
+            max_workers=args.max_workers,
+            stats_interval=args.stats_interval
             )
 
 
