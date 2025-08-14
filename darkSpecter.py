@@ -8,7 +8,7 @@
 # Optional (for --shots):
 #          pip install playwright && playwright install firefox
 
-import argparse, sys, time, random, pathlib, json, os, re, threading, traceback
+import argparse, sys, time, random, pathlib, json, os, re, threading, traceback, socket
 import requests
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +20,8 @@ INFLIGHT_LOCK = threading.Lock()
 VISITED_LOCK = threading.Lock()
 MATCHED_LOCK = threading.Lock()
 PARENT_LOCK = threading.Lock()
+ROTATE_LOCK = threading.Lock()
+ROTATE_COUNT = 0
 
 # ===== ANSI Colors =====
 RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
@@ -39,6 +41,14 @@ It spiders entire apps by default (keeps crawling even when a page doesn't match
 Supports: regex, JSON reports, global/per-URL auth, verbose/debug, live stats, rendering & screenshots.
 """
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0",
+]
+
+
 # ===== Helpers =====
 def load_urls(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -50,6 +60,21 @@ def make_base_session(socks_host="127.0.0.1", socks_port=9050, ua=None):
                  "https": f"socks5h://{socks_host}:{socks_port}"}
     s.headers.update({"User-Agent": ua or "Mozilla/5.0 (X11; Linux x86_64) DarkSpectre/1.6"})
     return s
+
+def rotate_tor_circuit(control_host="127.0.0.1", control_port=9051, password=None):
+    try:
+        with socket.create_connection((control_host, control_port), timeout=5) as s:
+            if password:
+                s.sendall(f'AUTHENTICATE "{password}"\r\n'.encode())
+            else:
+                s.sendall(b"AUTHENTICATE\r\n")
+            if not s.recv(1024).startswith(b"250"):
+                return False
+            s.sendall(b"SIGNAL NEWNYM\r\n")
+            return s.recv(1024).startswith(b"250")
+    except Exception as e:
+        print(f"[tor] circuit rotation failed: {e}")
+        return False
 
 def is_http_like(url):
     scheme = (urlparse(url).scheme or "").lower()
@@ -93,18 +118,21 @@ def same_site(u1, u2):
         return False
     return h1 == h2 or h1.endswith("." + h2) or h2.endswith("." + h1)
 
-def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug=False):
+def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug=False, ua_pool=None):
     try:
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+        }
+        if ua_pool:
+            headers["User-Agent"] = random.choice(ua_pool)
         r = session.get(
             url,
             timeout=timeout,
             allow_redirects=True,
             verify=verify_tls,
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate",
-            },
+            headers=headers,
         )
         ct = r.headers.get("Content-Type", "")
         if verbose:
@@ -229,13 +257,10 @@ def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval
     while not stop_evt.is_set():
         snap = stats.snapshot()
         
-        # Display queue size but rely on unfinished_tasks to decide completion
-        qsize = 0
+     # Use unfinished_tasks for accurate pending count (includes in-flight)
         try:
-            qsize = queue.qsize()
             pending = queue.unfinished_tasks
         except Exception:
-            pass
             pending = 0
 
         if pending == 0:
@@ -243,17 +268,13 @@ def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval
                 if INFLIGHT == 0:
                     stop_evt.set()
                     break
-        if qsize == 0:
-            with INFLIGHT_LOCK:
-                if INFLIGHT == 0:
-                    stop_evt.set()
-                    break    
+            
         # Use the ground truth for matched (and optionally visited)
         matched_count = len(matched_set or [])
         visited_count = snap["visited"] if visited_set is None else len(visited_set)
 
         rate = snap["fetched"] / snap["elapsed"]
-        line = (f"[stats] visited={visited_count} queued={qsize} matched={matched_count} "
+        line = (f"[stats] visited={visited_count} queued={pending} matched={matched_count} "
                 f"depth={snap['max_depth']} rate={rate:.2f}/s elapsed={int(snap['elapsed'])}s")
         if use_cr:
             print("\r" + line + " " * 10, end="", flush=True)
@@ -493,7 +514,8 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                  max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                  follow_only_if_match, crawl_log, delay, timeout, verify_tls, verbose, save_debug,
                  stats: CrawlStats, limiter, stop_evt: threading.Event,
-                 render_queue=None, shots=False, shot_mode="matches"):
+                 render_queue=None, shots=False, shot_mode="matches", ua_pool=None,
+                 rotate_every=0, control_host="127.0.0.1", control_port=9051, control_pass=None):
 
     while not stop_evt.is_set():
         try:
@@ -526,7 +548,14 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             # Enforce max-pages
             if not limiter.allow_fetch():
                 if crawl_log:
-                    print(f"{DIM}[limit]{RESET} max-pages reached, skipping fetch")
+                    print(f"{DIM}[limit]{RESET} max-pages reached, stopping crawl")
+                stop_evt.set()
+                while True:
+                    try:
+                        queue.get_nowait()
+                        queue.task_done()
+                    except Empty:
+                        break
                 continue
 
             # Pick session based on URL/profile
@@ -536,9 +565,16 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             txt = fetch_text(session, url, timeout,
                              verify_tls=verify_tls,
                              verbose=verbose,
-                             save_debug=save_debug)
+                             save_debug=save_debug,
+                             ua_pool=ua_pool)
             stats.on_fetch()
-
+            if rotate_every > 0:
+                with ROTATE_LOCK:
+                    global ROTATE_COUNT
+                    ROTATE_COUNT += 1
+                    if ROTATE_COUNT % rotate_every == 0:
+                        rotate_tor_circuit(control_host, control_port, control_pass)
+            
             if not txt:
                 if crawl_log:
                     print(f"{DIM}[fail]{RESET} {url}")
@@ -555,19 +591,19 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                     "chain": chain_for(url, parent_map)
                 })
                 # Schedule screenshot on match (matches mode)
-                if shots and shot_mode == "matches" and render_queue is not None:
+                if shots and shot_mode == "matches" and render_queue is not None and not stop_evt.is_set():
                     render_queue.put((url, depth))
 
             elif crawl_log:
                 print(f"{'  '*depth}[....] {url}")
-
+            
             # Screenshot ALL pages (enqueue to render thread)
-            if shots and shot_mode == "all" and render_queue is not None:
+            if shots and shot_mode == "all" and render_queue is not None and not stop_evt.is_set():
                 render_queue.put((url, depth))
 
-            # Spider children
+            # Spider children unless we've been told to stop
             should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
-            if should_expand:
+            if should_expand and not stop_evt.is_set():
                 children = extract_links(
                     url, txt,
                     allow_offdomain=allow_offdomain,
@@ -577,11 +613,12 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                 enq = 0
                 for link in children:
                     with VISITED_LOCK:
-                        already = (link in visited)
-                    if not already:
-                        with PARENT_LOCK:
-                            if link not in parent_map:
-                                parent_map[link] = url
+                        already_visited = (link in visited)
+                    with PARENT_LOCK:
+                        already_enqueued = (link in parent_map)
+                        if not already_enqueued:
+                            parent_map[link] = url
+                    if not already_visited and not already_enqueued:
                         queue.put((link, depth+1, url))
                         enq += 1
                         if crawl_log:
@@ -609,7 +646,8 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                     follow_only_if_match=False, shots=False, shot_mode="matches",
                     shots_dir=None, crawl_log=False, delay=0, timeout=30, verify_tls=True,
                     verbose=False, save_debug=False, max_workers=5, stats_interval=2.0,
-                    max_pages=0, render_settings=None):
+                    max_pages=0, render_settings=None, rotate_every=0, control_host="127.0.0.1",
+                    control_port=9051, control_pass=None, ua_pool=None):
 
     q = Queue()
     q.put((root_url, 0, None))
@@ -662,7 +700,10 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                         break
                 return
 
-            while not stop_evt.is_set():
+            while True:
+                # If we've been asked to stop and nothing remains, exit
+                if stop_evt.is_set() and render_queue.empty():
+                    break
                 try:
                     item = render_queue.get(timeout=0.5)
                 except Empty:
@@ -694,12 +735,14 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                 crawl_worker, q, session_router, matcher, matched, visited, parent_map, json_records,
                 max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
                 follow_only_if_match, crawl_log, delay, timeout, verify_tls, verbose, save_debug,
-                stats, limiter, stop_evt, render_queue, shots, shot_mode
+                stats, limiter, stop_evt, render_queue, shots, shot_mode, ua_pool,
+                rotate_every, control_host, control_port, control_pass
             )
         q.join()
 
     # Queue drained: signal workers/stats thread to exit
         stop_evt.set()
+   
    # Signal shutdown for stats + render threads
     if render_queue:
         render_queue.put(SENTINEL)
@@ -742,7 +785,10 @@ def main():
     p.add_argument("--socks-host", default="127.0.0.1", help="Tor SOCKS host")
     p.add_argument("--socks-port", type=int, default=9050, help="Tor SOCKS port")
     p.add_argument("--timeout", type=int, default=60, help="Per-request timeout seconds (default: 60)")
-
+    p.add_argument("--control-port", type=int, default=9051, help="Tor control port")
+    p.add_argument("--control-pass", help="Tor control password")
+    p.add_argument("--rotate-every", type=int, default=0, help="Rotate Tor circuit after N pages (0 disables)")
+    p.add_argument("--random-ua", action="store_true", help="Randomize User-Agent header on each request")
     # Verbose / TLS / Debug
     p.add_argument("--verbose", action="store_true", help="Print HTTP status and content-type for each fetch")
     p.add_argument("--no-verify", action="store_true", help="Disable TLS verification (debug only)")
@@ -779,9 +825,12 @@ def main():
     p.add_argument("--render-wait", choices=["load","domcontentloaded","networkidle"], default="networkidle",
                    help="Playwright wait_until condition (default: networkidle)")
 
+    
     # Concurrency / telemetry
     p.add_argument("--max-workers", type=int, default=5,
                    help="Max concurrent fetch workers")
+    p.add_argument("--low-concurrency", action="store_true",
+                   help="Use a single worker (overrides --max-workers)")
     p.add_argument("--stats-interval", type=float, default=2.0,
                    help="Seconds between live stats updates (0 to disable)")
     p.add_argument("--crawl-log", action="store_true",
@@ -793,6 +842,9 @@ def main():
 
     args = p.parse_args()
     print(ASCII_BANNER)
+    
+    if args.low_concurrency:
+        args.max_workers = 1
 
     urls = load_urls(args.url_list)
     if not urls:
@@ -873,7 +925,12 @@ def main():
             max_workers=args.max_workers,
             stats_interval=args.stats_interval,
             max_pages=args.max_pages,
-            render_settings=render_settings
+            render_settings=render_settings,
+            rotate_every=args.rotate_every,
+            control_host=args.socks_host,
+            control_port=args.control_port,
+            control_pass=args.control_pass,
+            ua_pool=USER_AGENTS if args.random_ua else None,
         )
 
     out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
