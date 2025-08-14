@@ -1,0 +1,12 @@
+requests>=2.31.0
+requests[socks]>=2.31.0
+beautifulsoup4>=4.12.3
+lxml>=5.2.2
+html5lib>=1.1
+tldextract>=5.1.2
+urllib3[socks]>=2.2.2
+regex>=2024.4.28
+selenium>=4.21.0
+webdriver-manager>=4.0.1
+playwright>=1.44.0
+colorama>=0.4.6
