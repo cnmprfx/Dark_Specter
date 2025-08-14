@@ -154,12 +154,12 @@ You can pass a JSON auth file via `--auth-file FILE` containing session data per
 
 ## Screenshots
 
-Requires `--render` and `playwright` installed.
+Requires `playwright` installed.
 Example:
 
 ```bash
 python3 darkSpecter.py urls.txt "keyword" \
-    --shots --shot-mode matches --shots-dir ./shots --render
+    --shots --shot-mode matches --shots-dir ./shots
 ```
 
 * **matches** – Only screenshot pages containing the keyword/regex
