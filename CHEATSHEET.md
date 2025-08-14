@@ -5,7 +5,7 @@
 | Argument    | Example                                        |
 | ----------- | ---------------------------------------------- |
 | `URLS_FILE` | `python3 darkSpecter.py urls.txt "keyword"`    |
-| `PHRASE`    | `python3 darkSpecter.py urls.txt "ransomware"` |
+| `PHRASE`    | `python3 darkSpecter.py urls.txt "ransomware group"` |
 
 ## Output & Matching
 | Option             | Description                  | Example                                                             |
