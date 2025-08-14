@@ -12,13 +12,13 @@
 
 
 
-# 🕵️‍♂️ Dark Specter - Tor Keyword Hunter
+#  Dark Specter - Tor Keyword Hunter
 
 **Dark Specter** is a high-performance, multithreaded crawler for the Tor/Darknet and regular web, designed to search for specific words or phrases, capture screenshots, and optionally authenticate to sites that require login. It is optimized for OPSEC, large-scale scraping, and investigative workflows.
 
 ---
 
-## 🚀 Features
+## Features
 
 - **Recursive Spidering** – Crawl entire onion or clearnet sites up to a specified depth
 - **Regex or Simple Match** – Match exact phrases or full regex patterns
@@ -35,7 +35,7 @@
 
 ---
 
-## ⚙️ Installation
+##  Installation
 
 ```bash
 # Clone repo
@@ -194,6 +194,6 @@ Do not use it on systems or networks you do not own or have explicit permission 
 
 ## License
 
-MIT License – see [LICENSE](LICENSE) for details.
+MIT License 
 
 
