@@ -530,11 +530,25 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             INFLIGHT += 1
 
         try:
-            # de-dupe / mark visited early
+            # de-dupe / enforce max-pages / mark visited
             with VISITED_LOCK:
                 if url in visited:
                     continue
-                visited.add(url)
+                allowed = limiter.allow_fetch()
+                if allowed:
+                    visited.add(url)
+                else:
+                    if crawl_log:
+                        print(f"{DIM}[limit]{RESET} max-pages reached, stopping crawl")
+                    stop_evt.set()
+            if not allowed:
+                while True:
+                    try:
+                        queue.get_nowait()
+                        queue.task_done()
+                    except Empty:
+                        break
+                break
             stats.on_visit(depth)
 
             if parent:
@@ -545,20 +559,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             if crawl_log:
                 print(f"{'  '*depth}[fetch] depth={depth} url={url}")
 
-            # Enforce max-pages
-            if not limiter.allow_fetch():
-                if crawl_log:
-                    print(f"{DIM}[limit]{RESET} max-pages reached, stopping crawl")
-                stop_evt.set()
-                while True:
-                    try:
-                        queue.get_nowait()
-                        queue.task_done()
-                    except Empty:
-                        break
-                continue
-
-            # Pick session based on URL/profile
+                        # Pick session based on URL/profile
             session = session_router.session_for(url)
 
             # Fetch
@@ -614,11 +615,17 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                 for link in children:
                     with VISITED_LOCK:
                         already_visited = (link in visited)
+                        total_known = len(visited) + queue.unfinished_tasks
+                    if limiter.max_pages > 0 and total_known >= limiter.max_pages:
+                        break
                     with PARENT_LOCK:
                         already_enqueued = (link in parent_map)
-                        if not already_enqueued:
+                        if not already_enqueued and not already_visited:
                             parent_map[link] = url
-                    if not already_visited and not already_enqueued:
+                            do_enqueue = True
+                        else:
+                            do_enqueue = False
+                    if do_enqueue:
                         queue.put((link, depth+1, url))
                         enq += 1
                         if crawl_log:
