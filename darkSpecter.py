@@ -208,7 +208,7 @@ def build_matcher(phrase, use_regex):
             print(f"Invalid regex: {e}", file=sys.stderr); sys.exit(2)
     else:
         rx = re.compile(re.escape(phrase), re.IGNORECASE)
-    return lambda text: (text is not None) and (rx.search(text) is not None)
+    return lambda text: rx.search(text or "")
 
 def chain_for(url, parent_map):
     chain, cur, seen = [], url, set()
@@ -582,11 +582,11 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                 continue
 
             # Match check
-            is_match = matcher(txt)
-            if is_match:
+            match = matcher(txt)
+            if match:
                 with MATCHED_LOCK:
                     matched.add(url)
-                print(f"{RED}{'  '*depth}[MATCH]{RESET} {url}")
+                print(f"{RED}{'  '*depth}[MATCH]{RESET} {url} -- {match.group(0)}")
                 json_records.append({
                     "url": url, "depth": depth, "parent": parent,
                     "chain": chain_for(url, parent_map)
@@ -603,7 +603,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                 render_queue.put((url, depth))
 
             # Spider children unless we've been told to stop
-            should_expand = (depth < max_depth) and (not follow_only_if_match or is_match)
+            should_expand = (depth < max_depth) and (not follow_only_if_match or match)
             if should_expand and not stop_evt.is_set():
                 children = extract_links(
                     url, txt,
