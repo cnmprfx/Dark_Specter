@@ -8,11 +8,15 @@
 # Optional (for --shots):
 #          pip install playwright && playwright install firefox
 
-import argparse, sys, time, random, pathlib, json, os, re, threading, traceback, socket
+import argparse, sys, time, random, pathlib, json, os, re, threading, traceback, socket, contextlib
+import warnings
 import requests
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
+from bs4 import XMLParsedAsHTMLWarning
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # ===== Global locks for shared state =====
 INFLIGHT = 0
@@ -22,6 +26,8 @@ MATCHED_LOCK = threading.Lock()
 PARENT_LOCK = threading.Lock()
 ROTATE_LOCK = threading.Lock()
 ROTATE_COUNT = 0
+ACTIVE_WORKERS = 0
+ACTIVE_WORKERS_LOCK = threading.Lock()
 
 # ===== ANSI Colors =====
 RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
@@ -77,7 +83,12 @@ def rotate_tor_circuit(control_host="127.0.0.1", control_port=9051, password=Non
         return False
 
 def is_http_like(url):
-    scheme = (urlparse(url).scheme or "").lower()
+    try:
+        scheme = (urlparse(url).scheme or "").lower()
+    except ValueError as e:
+        if os.environ.get("DEBUG"):
+            print(f"[debug] urlparse failed for {url}: {e}", file=sys.stderr)
+        return False
     return scheme in ("http", "https", "")
 
 def compile_exclude_patterns(patterns):
@@ -157,16 +168,25 @@ def fetch_text(session, url, timeout, verify_tls=True, verbose=False, save_debug
         return None
 
 PLAIN_URL_RE = re.compile(r'\bhttps?://[^\s"\'<>]+', re.IGNORECASE)
-def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False, exclude_patterns=None):
-    exclude_patterns = exclude_patterns or []
+
+
+def make_soup(html, content_type=None):
     try:
         from bs4 import BeautifulSoup
     except ImportError:
         print("Missing dependency: beautifulsoup4\nInstall with: pip install beautifulsoup4", file=sys.stderr)
         sys.exit(1)
+    ct = (content_type or "").lower()
+    if "xml" in ct or (html or "").lstrip().startswith("<?xml"):
+        return BeautifulSoup(html or "", "xml")
+    return BeautifulSoup(html or "", "html.parser")
 
+
+def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False, exclude_patterns=None):
+    exclude_patterns = exclude_patterns or []
+    
     links = set()
-    soup = BeautifulSoup(html or "", "html.parser")
+    soup = make_soup(html)
 
     # <a>
     for a in soup.find_all("a", href=True):
@@ -189,15 +209,20 @@ def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False,
     # Scope filtering
     filtered = set()
     for abs_url in links:
-        if not is_http_like(abs_url):
-            continue
-        if is_excluded(abs_url, exclude_patterns):
-            continue
-        if allow_offdomain:
-            filtered.add(abs_url)
-        else:
-            if same_domain(base_url, abs_url) or (allow_subdomains and same_site(base_url, abs_url)):
+        try:
+            if not is_http_like(abs_url):
+                continue
+            if is_excluded(abs_url, exclude_patterns):
+                continue
+            if allow_offdomain:
                 filtered.add(abs_url)
+            else:
+                if same_domain(base_url, abs_url) or (allow_subdomains and same_site(base_url, abs_url)):
+                    filtered.add(abs_url)
+        except ValueError as e:
+            if os.environ.get("DEBUG"):
+                print(f"[debug] skipping malformed url {abs_url}: {e}", file=sys.stderr)
+            continue
     return list(filtered)
 
 def build_matcher(phrase, use_regex):
@@ -272,10 +297,13 @@ def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval
         # Use the ground truth for matched (and optionally visited)
         matched_count = len(matched_set or [])
         visited_count = snap["visited"] if visited_set is None else len(visited_set)
-
+        with ACTIVE_WORKERS_LOCK:
+            workers = ACTIVE_WORKERS
+        
         rate = snap["fetched"] / snap["elapsed"]
         line = (f"[stats] visited={visited_count} queued={pending} matched={matched_count} "
-                f"depth={snap['max_depth']} rate={rate:.2f}/s elapsed={int(snap['elapsed'])}s")
+                f"workers={workers} depth={snap['max_depth']} rate={rate:.2f}/s "
+                f"elapsed={int(snap['elapsed'])}s")
         if use_cr:
             print("\r" + line + " " * 10, end="", flush=True)
         else:
@@ -313,15 +341,10 @@ def parse_kv_pairs(pairs):
         out[k] = v
     return out
 
-def get_csrf_value(html, selector, attr):
+def get_csrf_value(html, selector, attr, content_type=None):
     if not selector:
         return None
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        print("Missing dependency: beautifulsoup4\nInstall with: pip install beautifulsoup4", file=sys.stderr)
-        sys.exit(1)
-    soup = BeautifulSoup(html, "html.parser")
+    soup = make_soup(html, content_type)
     el = soup.select_one(selector)
     if not el:
         return None
@@ -358,11 +381,11 @@ def do_form_auth(session, auth_url, method, username, password,
         payload[pass_field] = password
 
     if csrf_selector:
-        token = get_csrf_value(r.text, csrf_selector, csrf_attr or "value")
+        ct = r.headers.get("Content-Type")
+        token = get_csrf_value(r.text, csrf_selector, csrf_attr or "value", ct)
         if token is not None:
             try:
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(r.text, "html.parser")
+                soup = make_soup(r.text, ct)
                 el = soup.select_one(csrf_selector)
                 name = el.get("name") if el else None
             except Exception:
@@ -509,6 +532,16 @@ def _safe_name(url, depth):
     ts = _time.strftime("%Y%m%d-%H%M%S")
     return f"d{depth}_{ts}_{base[:120]}.png"
 
+@contextlib.contextmanager
+def queue_task_done(q):
+    try:
+        yield
+    finally:
+        try:
+            q.task_done()
+        except Exception:
+            pass
+
 # ===== Worker & Crawl =====
 def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, json_records,
                  max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
@@ -517,136 +550,146 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                  render_queue=None, shots=False, shot_mode="matches", ua_pool=None,
                  rotate_every=0, control_host="127.0.0.1", control_port=9051, control_pass=None):
 
-    while not stop_evt.is_set():
-        try:
-            url, depth, parent = queue.get(timeout=0.5)
-        except Empty:
-            continue
-        except Exception:
-            break
+    global ACTIVE_WORKERS
+    with ACTIVE_WORKERS_LOCK:
+        ACTIVE_WORKERS += 1
+    print(f"[worker start] {threading.current_thread().name}")
 
-        with INFLIGHT_LOCK:
-            global INFLIGHT
-            INFLIGHT += 1
-
-        try:
-            # de-dupe / enforce max-pages / mark visited
-            with VISITED_LOCK:
-                if url in visited:
-                    continue
-                allowed = limiter.allow_fetch()
-                if allowed:
-                    visited.add(url)
-                else:
-                    if crawl_log:
-                        print(f"{DIM}[limit]{RESET} max-pages reached, stopping crawl")
-                    stop_evt.set()
-            if not allowed:
-                while True:
-                    try:
-                        queue.get_nowait()
-                        queue.task_done()
-                    except Empty:
-                        break
-                break
-            stats.on_visit(depth)
-
-            if parent:
-                with PARENT_LOCK:
-                    if url not in parent_map:
-                        parent_map[url] = parent
-
-            if crawl_log:
-                print(f"{'  '*depth}[fetch] depth={depth} url={url}")
-
-                        # Pick session based on URL/profile
-            session = session_router.session_for(url)
-
-            # Fetch
-            txt = fetch_text(session, url, timeout,
-                             verify_tls=verify_tls,
-                             verbose=verbose,
-                             save_debug=save_debug,
-                             ua_pool=ua_pool)
-            stats.on_fetch()
-            if rotate_every > 0:
-                with ROTATE_LOCK:
-                    global ROTATE_COUNT
-                    ROTATE_COUNT += 1
-                    if ROTATE_COUNT % rotate_every == 0:
-                        rotate_tor_circuit(control_host, control_port, control_pass)
-            
-            if not txt:
-                if crawl_log:
-                    print(f"{DIM}[fail]{RESET} {url}")
-                continue
-
-            # Match check
-            match = matcher(txt)
-            if match:
-                with MATCHED_LOCK:
-                    matched.add(url)
-                print(f"{RED}{'  '*depth}[MATCH]{RESET} {url} -- {match.group(0)}")
-                json_records.append({
-                    "url": url, "depth": depth, "parent": parent,
-                    "chain": chain_for(url, parent_map)
-                })
-                # Schedule screenshot on match (matches mode)
-                if shots and shot_mode == "matches" and render_queue is not None and not stop_evt.is_set():
-                    render_queue.put((url, depth))
-
-            elif crawl_log:
-                print(f"{'  '*depth}[....] {url}")
-            
-            # Screenshot ALL pages (enqueue to render thread)
-            if shots and shot_mode == "all" and render_queue is not None and not stop_evt.is_set():
-                render_queue.put((url, depth))
-
-            # Spider children unless we've been told to stop
-            should_expand = (depth < max_depth) and (not follow_only_if_match or match)
-            if should_expand and not stop_evt.is_set():
-                children = extract_links(
-                    url, txt,
-                    allow_offdomain=allow_offdomain,
-                    allow_subdomains=allow_subdomains,
-                    exclude_patterns=exclude_patterns
-                )
-                enq = 0
-                for link in children:
-                    with VISITED_LOCK:
-                        already_visited = (link in visited)
-                        total_known = len(visited) + queue.unfinished_tasks
-                    if limiter.max_pages > 0 and total_known >= limiter.max_pages:
-                        break
-                    with PARENT_LOCK:
-                        already_enqueued = (link in parent_map)
-                        if not already_enqueued and not already_visited:
-                            parent_map[link] = url
-                            do_enqueue = True
-                        else:
-                            do_enqueue = False
-                    if do_enqueue:
-                        queue.put((link, depth+1, url))
-                        enq += 1
-                        if crawl_log:
-                            print(f"{'  '*(depth+1)}[enqueue] {link}")
-                if crawl_log:
-                    print(f"{'  '*depth}[links] extracted={len(children)} enqueued={enq} depth={depth+1}")
-
-            if delay > 0:
-                time.sleep(delay + random.uniform(0, 0.8))
-
-        except Exception as e:
-            print(f"[worker ERROR] {type(e).__name__}: {e}")
-            traceback.print_exc()
-        finally:
+    try:
+        while not stop_evt.is_set():
             try:
-                # Mark queue item done exactly once for all code paths
-                queue.task_done()
-            except Exception:
-                pass
-            with INFLIGHT_LOCK:
-                INFLIGHT -= 1
+                url, depth, parent = queue.get(timeout=0.5)
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"[worker get] {type(e).__name__}: {e}")
+                break
+            with queue_task_done(queue):
+                with INFLIGHT_LOCK:
+                    global INFLIGHT
+                    INFLIGHT += 1
+                try:
+                    # de-dupe / enforce max-pages / mark visited
+                    with VISITED_LOCK:
+                        if url in visited:
+                            continue
+                        allowed = limiter.allow_fetch()
+                        if allowed:
+                            visited.add(url)
+                        else:
+                            if crawl_log:
+                                print(f"{DIM}[limit]{RESET} max-pages reached, stopping crawl")
+                            stop_evt.set()
+                    if not allowed:
+                        while True:
+                            try:
+                                queue.get_nowait()
+                                queue.task_done()
+                            except Empty:
+                                break
+                        break
+                    stats.on_visit(depth)
+
+                    if parent:
+                        with PARENT_LOCK:
+                            if url not in parent_map:
+                                parent_map[url] = parent
+
+                    if crawl_log:
+                        print(f"{'  '*depth}[fetch] depth={depth} url={url}")
+
+                    # Pick session based on URL/profile
+                    session = session_router.session_for(url)
+
+                    # Fetch
+                    txt = fetch_text(session, url, timeout,
+                                     verify_tls=verify_tls,
+                                     verbose=verbose,
+                                     save_debug=save_debug,
+                                     ua_pool=ua_pool)
+                    stats.on_fetch()
+                    if rotate_every > 0:
+                        with ROTATE_LOCK:
+                            global ROTATE_COUNT
+                            ROTATE_COUNT += 1
+                            if ROTATE_COUNT % rotate_every == 0:
+                                rotate_tor_circuit(control_host, control_port, control_pass)
+
+                    if not txt:
+                        print(f"{DIM}[fail]{RESET} {url}")
+                        continue
+
+                    # Match check
+                    match = matcher(txt)
+                    if match:
+                        with MATCHED_LOCK:
+                            matched.add(url)
+                        print(f"{RED}{'  '*depth}[MATCH]{RESET} {url} -- {match.group(0)}")
+                        json_records.append({
+                            "url": url, "depth": depth, "parent": parent,
+                            "chain": chain_for(url, parent_map)
+                        })
+                        # Schedule screenshot on match (matches mode)
+                        if shots and shot_mode == "matches" and render_queue is not None and not stop_evt.is_set():
+                            render_queue.put((url, depth))
+
+                    elif crawl_log:
+                        print(f"{'  '*depth}[....] {url}")
+
+                    # Screenshot ALL pages (enqueue to render thread)
+                    if shots and shot_mode == "all" and render_queue is not None and not stop_evt.is_set():
+                        render_queue.put((url, depth))
+
+                    # Spider children unless we've been told to stop
+                    should_expand = (depth < max_depth) and (not follow_only_if_match or match)
+                    if should_expand and not stop_evt.is_set():
+                        children = extract_links(
+                            url, txt,
+                            allow_offdomain=allow_offdomain,
+                            allow_subdomains=allow_subdomains,
+                            exclude_patterns=exclude_patterns
+                        )
+                        enq = 0
+                        for link in children:
+                            with VISITED_LOCK:
+                                already_visited = (link in visited)
+                                total_known = len(visited) + queue.unfinished_tasks
+                            if limiter.max_pages > 0 and total_known >= limiter.max_pages:
+                                break
+                            with PARENT_LOCK:
+                                already_enqueued = (link in parent_map)
+                                if not already_enqueued and not already_visited:
+                                    parent_map[link] = url
+                                    do_enqueue = True
+                                else:
+                                    do_enqueue = False
+                            if do_enqueue:
+                                queue.put((link, depth+1, url))
+                                enq += 1
+                                if crawl_log:
+                                    print(f"{'  '*(depth+1)}[enqueue] {link}")
+                        if crawl_log:
+                            print(f"{'  '*depth}[links] extracted={len(children)} enqueued={enq} depth={depth+1}")
+
+                    if delay > 0:
+                        time.sleep(delay + random.uniform(0, 0.8))
+
+                except Exception as e:
+                    print(f"[worker ERROR] {type(e).__name__}: {e}")
+                    traceback.print_exc()
+                finally:
+                    with INFLIGHT_LOCK:
+                        INFLIGHT -= 1
+    except BaseException as e:
+        print(f"[worker fatal] {type(e).__name__}: {e}")
+        traceback.print_exc()
+    finally:
+        with ACTIVE_WORKERS_LOCK:
+            ACTIVE_WORKERS -= 1
+            remaining = ACTIVE_WORKERS
+        print(f"[worker exit] {threading.current_thread().name} (remaining={remaining})")
+        if remaining == 0:
+            stop_evt.set()
 
 def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_map, json_records,
                     max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
@@ -654,7 +697,7 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                     shots_dir=None, crawl_log=False, delay=0, timeout=30, verify_tls=True,
                     verbose=False, save_debug=False, max_workers=5, stats_interval=2.0,
                     max_pages=0, render_settings=None, rotate_every=0, control_host="127.0.0.1",
-                    control_port=9051, control_pass=None, ua_pool=None):
+                    control_port=9051, control_pass=None, ua_pool=None, render_queue_timeout=5.0):
 
     q = Queue()
     q.put((root_url, 0, None))
@@ -676,13 +719,17 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
     # Optional render queue/worker (create & use Playwright **inside** this thread)
     render_queue = None
     render_thread = None
+    render_active = False
     SENTINEL = object()
+    render_active = False
     if shots:
         shots_dir = shots_dir or "screenshots"
         os.makedirs(shots_dir, exist_ok=True)
         render_queue = Queue()
-
+        render_active = True
+        
         def render_worker():
+            nonlocal render_active
             renderer_local = None
             try:
                 # Build a fresh Renderer in THIS thread only
@@ -693,9 +740,11 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                     wait_until=render_settings["wait_until"],
                     timeout_ms=render_settings["timeout_ms"],
                 )
+                render_active = True
             except RuntimeError as e:
                 print(f"[render] {e}")
                 print("[render] Rendering disabled (continuing without renderer).")
+                render_active = False
                 # Drain items so workers don't block forever
                 while True:
                     try:
@@ -752,10 +801,17 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
    
    # Signal shutdown for stats + render threads
     if render_queue:
-        render_queue.put(SENTINEL)
-        render_queue.join()
-        if render_thread:
+        if render_queue and render_thread and render_active and render_thread.is_alive():
+            render_queue.put(SENTINEL)
+            render_queue.join()
+            start = time.time()
+            while render_queue.unfinished_tasks:
+                if time.time() - start > render_queue_timeout:
+                    print(f"[render] warning: {render_queue.unfinished_tasks} screenshot task(s) still pending", file=sys.stderr)
+                    break
+                time.sleep(0.1)
             render_thread.join(timeout=1.0)
+        
     if stats_interval and stats_interval > 0 and stats_thread:
         stats_thread.join(timeout=1.0)
 
