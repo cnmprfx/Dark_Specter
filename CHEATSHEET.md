@@ -32,7 +32,11 @@
 | `--socks-host HOST` | `python3 darkSpecter.py urls.txt "key" --socks-host 192.0.2.5` |
 | `--socks-port PORT` | `python3 darkSpecter.py urls.txt "key" --socks-port 9150`      |
 | `--timeout SECS`    | `python3 darkSpecter.py urls.txt "key" --timeout 90`           |
-
+| `--control-port PORT` | `python3 darkSpecter.py urls.txt "key" --control-port 9051` |
+| `--control-pass PASS` | `python3 darkSpecter.py urls.txt "key" --control-pass torpw` |
+| `--rotate-every N` | `python3 darkSpecter.py urls.txt "key" --rotate-every 10` |
+| `--random-ua` | `python3 darkSpecter.py urls.txt "key" --random-ua` |
+*Note:* `--rotate-every` needs Tor control-port access (and `--control-pass` if set) to request a new circuit. `--random-ua` simply randomizes the User-Agent each request.
 ## Verbosity, TLS & Debug
 | Option         | Example                                              |
 | -------------- | ---------------------------------------------------- |
@@ -80,11 +84,12 @@
 | `--render-wait STATE` (`load`, `domcontentloaded`, `networkidle`) | `python3 darkSpecter.py urls.txt "key" --shots --render-wait domcontentloaded` |
 
 ## Concurrency, Stats & Logging
-| Option                  | Example                                                    |
-| ----------------------- | ---------------------------------------------------------- |
-| `--max-workers N`       | `python3 darkSpecter.py urls.txt "key" --max-workers 10`   |
-| `--stats-interval SECS` | `python3 darkSpecter.py urls.txt "key" --stats-interval 5` |
-| `--crawl-log`           | `python3 darkSpecter.py urls.txt "key" --crawl-log`        |
+| Option                  | Description                                      | Example                                                   |
+| ----------------------- | ------------------------------------------------ | --------------------------------------------------------- |
+| `--max-workers N`       | Max concurrent fetch workers                     | `python3 darkSpecter.py urls.txt "key" --max-workers 10`  |
+| `--low-concurrency`     | Use a single worker (overrides `--max-workers`)  | `python3 darkSpecter.py urls.txt "key" --low-concurrency` |
+| `--stats-interval SECS` | Seconds between live stats updates (0 to disable) | `python3 darkSpecter.py urls.txt "key" --stats-interval 5` |
+| `--crawl-log`           | Show each page fetch and enqueue in real-time    | `python3 darkSpecter.py urls.txt "key" --crawl-log`       |
 
 ## Putting It All Together
 ```
