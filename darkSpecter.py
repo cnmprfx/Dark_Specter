@@ -330,6 +330,11 @@ class PageLimiter:
             self._count += 1
             return True
 
+    def reset(self):
+        """Reset the internal fetch count back to zero."""
+        with self._lock:
+            self._count = 0
+
 # ===== Auth & Session helpers =====
 def parse_kv_pairs(pairs):
     out = {}
@@ -696,7 +701,7 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                     follow_only_if_match=False, shots=False, shot_mode="matches",
                     shots_dir=None, crawl_log=False, delay=0, timeout=30, verify_tls=True,
                     verbose=False, save_debug=False, max_workers=5, stats_interval=2.0,
-                    max_pages=0, render_settings=None, rotate_every=0, control_host="127.0.0.1",
+                    limiter=None, render_settings=None, rotate_every=0, control_host="127.0.0.1",
                     control_port=9051, control_pass=None, ua_pool=None, render_queue_timeout=5.0):
 
     q = Queue()
@@ -704,7 +709,8 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
 
     stats = CrawlStats()
     stop_evt = threading.Event()
-    limiter = PageLimiter(max_pages)
+    if limiter is None:
+        raise ValueError("limiter must be provided")
 
     # Live stats thread (single line when crawl_log is off)
     stats_thread = None
@@ -960,9 +966,10 @@ def main():
         "wait_until": args.render_wait,
         "timeout_ms": args.render_timeout,
     }
-
+    limiter = PageLimiter(args.max_pages)
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
+        limiter.reset()
         crawl_recursive(
             session_router=session_router,
             root_url=seed,
@@ -987,7 +994,7 @@ def main():
             save_debug=args.save_debug,
             max_workers=args.max_workers,
             stats_interval=args.stats_interval,
-            max_pages=args.max_pages,
+            limiter=limiter,
             render_settings=render_settings,
             rotate_every=args.rotate_every,
             control_host=args.socks_host,
