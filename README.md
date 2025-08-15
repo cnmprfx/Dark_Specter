@@ -112,7 +112,7 @@ python3 darkSpecter.py urls.txt "Keyword/Phrase" \
 | `--save-debug`                           | Save raw HTML of fetched pages                                           |                                      |
 
 ---
->*Note:* if adding screenshots to the crawl set `--render-timout` to a low number to avoid hanging on exit.
+
 
 ## Live Stats Output
 
@@ -165,7 +165,7 @@ python3 darkSpecter.py urls.txt "keyword" \
 
 * **matches** – Only screenshot pages containing the keyword/regex
 * **all** – Screenshot every fetched page
-
+>*Note:* if adding screenshots to the crawl set `--render-timout` to a low number to avoid hanging on exit.
 ---
 
 ## Domain Exclusion
