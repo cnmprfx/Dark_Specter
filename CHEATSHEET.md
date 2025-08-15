@@ -1,11 +1,16 @@
-# Dark Specter Cheat Sheet
-> python3 darkSpecter.py URLS_FILE "KEYWORD_OR_REGEX" [options]
+# Dark Spectre Cheat Sheet
+### Run the crawler with a URL list and search phrase, adding any desired options:
+```python darkSpecter.py URL_LIST PHRASE [options]```
+## Core
+| Option            | Purpose                                                                | Example                  |
+| ----------------- | ---------------------------------------------------------------------- | ------------------------ |
+| `url_list`        | File containing one URL per line to crawl                              | `urls.txt`               |
+| `phrase`          | Word or regex pattern to search for (case-insensitive)                 | `"treasure"`             |
+| `-o, --out PATH`  | File to record matching URLs (default `matches.txt`)                   | `--out hits.txt`         |
+| `--json`          | Emit a JSON report in addition to text output                          | `--json`                 |
+| `--json-out PATH` | Where to write the JSON report (default `matches.json`)                | `--json-out report.json` |
+| `--regex`         | Interpret `PHRASE` as a regular expression instead of a literal string | `--regex`                |
 
-## Positional Arguments
-| Argument    | Example                                        |
-| ----------- | ---------------------------------------------- |
-| `URLS_FILE` | `python3 darkSpecter.py urls.txt "keyword"`    |
-| `PHRASE`    | `python3 darkSpecter.py urls.txt "ransomware group"` |
 
 ## Output & Matching
 | Option             | Description                  | Example                                                             |
@@ -16,33 +21,36 @@
 | `--regex`          | Treat `PHRASE` as regex      | `python3 darkSpecter.py urls.txt "user\\d+" --regex`                |
 
 ## Crawl Behavior
-| Option                       | Example                                                                               |
-| ---------------------------- | ------------------------------------------------------------------------------------- |
-| `--max-depth N`              | `python3 darkSpecter.py urls.txt "key" --max-depth 5`                                 |
-| `--max-pages N`              | `python3 darkSpecter.py urls.txt "key" --max-pages 200`                               |
-| `--delay SECS`               | `python3 darkSpecter.py urls.txt "key" --delay 2.5`                                   |
-| `--offdomain`                | `python3 darkSpecter.py urls.txt "key" --offdomain`                                   |
-| `--allow-subdomains`         | `python3 darkSpecter.py urls.txt "key" --allow-subdomains`                            |
-| `--exclude-domains PATTERN…` | `python3 darkSpecter.py urls.txt "key" --exclude-domains ".*bitcoin.*" badsite.onion` |
-| `--follow-only-if-match`     | `python3 darkSpecter.py urls.txt "key" --follow-only-if-match`                        |
+| Option                       | Purpose                                                                 | Example                                         |
+| ---------------------------- | ----------------------------------------------------------------------- | ----------------------------------------------- |
+| `--max-depth N`              | Maximum recursion depth (default 3)                                     | `--max-depth 5`                                 |
+| `--max-pages N`              | Cap on total pages fetched (default 400)                                | `--max-pages 1000`                              |
+| `--delay SEC`                | Base delay between requests in seconds (default 1.2)                    | `--delay 0.5`                                   |
+| `--offdomain`                | Allow following links to different domains/hidden services              | `--offdomain`                                   |
+| `--allow-subdomains`         | Treat subdomains (incl. `www`) as same site when `--offdomain` is unset | `--allow-subdomains`                            |
+| `--exclude-domains PATTERN…` | Skip domains matching any regex pattern provided                        | `--exclude-domains '.*bitcoin.*' badsite.onion` |
+| `--follow-only-if-match`     | Only follow links when the current page matches the search phrase       | `--follow-only-if-match`                        |
 
-## Network & Timing
-| Option              | Example                                                        |
-| ------------------- | -------------------------------------------------------------- |
-| `--socks-host HOST` | `python3 darkSpecter.py urls.txt "key" --socks-host 192.0.2.5` |
-| `--socks-port PORT` | `python3 darkSpecter.py urls.txt "key" --socks-port 9150`      |
-| `--timeout SECS`    | `python3 darkSpecter.py urls.txt "key" --timeout 90`           |
-| `--control-port PORT` | `python3 darkSpecter.py urls.txt "key" --control-port 9051` |
-| `--control-pass PASS` | `python3 darkSpecter.py urls.txt "key" --control-pass torpw` |
-| `--rotate-every N` | `python3 darkSpecter.py urls.txt "key" --rotate-every 10` |
-| `--random-ua` | `python3 darkSpecter.py urls.txt "key" --random-ua` |
+
+## Tor & HTTP
+| Option                | Purpose                                       | Example                 |
+| --------------------- | --------------------------------------------- | ----------------------- |
+| `--socks-host HOST`   | Tor SOCKS proxy host (default `127.0.0.1`)    | `--socks-host 10.0.0.2` |
+| `--socks-port PORT`   | Tor SOCKS proxy port (default `9050`)         | `--socks-port 9150`     |
+| `--timeout SEC`       | Per-request timeout in seconds (default 60)   | `--timeout 30`          |
+| `--control-port PORT` | Tor control port (default `9051`)             | `--control-port 9151`   |
+| `--control-pass PASS` | Tor control password                          | `--control-pass mypass` |
+| `--rotate-every N`    | Rotate Tor circuit after N pages (0 disables) | `--rotate-every 50`     |
+| `--random-ua`         | Randomize User-Agent header on each request   | `--random-ua`           |
+
 *Note:* `--rotate-every` needs Tor control-port access (and `--control-pass` if set) to request a new circuit. `--random-ua` simply randomizes the User-Agent each request.
 ## Verbosity, TLS & Debug
-| Option         | Example                                              |
-| -------------- | ---------------------------------------------------- |
-| `--verbose`    | `python3 darkSpecter.py urls.txt "key" --verbose`    |
-| `--no-verify`  | `python3 darkSpecter.py urls.txt "key" --no-verify`  |
-| `--save-debug` | `python3 darkSpecter.py urls.txt "key" --save-debug` |
+| Option         | Purpose                                              | Example        |
+| -------------- | ---------------------------------------------------- | -------------- |
+| `--verbose`    | Print HTTP status and content-type for each fetch    | `--verbose`    |
+| `--no-verify`  | Disable TLS certificate verification (debug)         | `--no-verify`  |
+| `--save-debug` | Save fetched HTML into `debug_pages/` for inspection | `--save-debug` |
+
 
 ## Authentication
 ### Global Modes
@@ -75,15 +83,16 @@
 | `--session-map FILE` | `python3 darkSpecter.py urls.txt "key" --session-map sessions.json` |
 
 ## Screenshots & Rendering
-| Option                                                            | Example                                                                        |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `--shots`                                                         | `python3 darkSpecter.py urls.txt "key" --shots`                                |
-| `--shots-dir DIR`                                                 | `python3 darkSpecter.py urls.txt "key" --shots --shots-dir shots`              |
-| `--shot-mode MODE` (`matches`/`all`)                              | `python3 darkSpecter.py urls.txt "key" --shots --shot-mode all`                |
-| `--render-timeout MS`                                             | `python3 darkSpecter.py urls.txt "key" --shots --render-timeout 45000`         |
-| `--render-wait STATE` (`load`, `domcontentloaded`, `networkidle`) | `python3 darkSpecter.py urls.txt "key" --shots --render-wait domcontentloaded` |
+| Option                                              | Purpose                                                     | Example                  |
+| --------------------------------------------------- | ----------------------------------------------------------- | ------------------------ |
+| `--shots`                                           | Capture screenshots via a dedicated render thread           | `--shots`                |
+| `--shots-dir DIR`                                   | Directory to store screenshots (default `screenshots`)      | `--shots-dir grabs`      |
+| `--shot-mode matches\|all`                          | Capture only matched pages or all pages (default `matches`) | `--shot-mode all`        |
+| `--render-timeout MS`                               | Page navigation timeout in milliseconds (default 30000)     | `--render-timeout 60000` |
+| `--render-wait load\|domcontentloaded\|networkidle` | Playwright `wait_until` condition (default `networkidle`)   | `--render-wait load`     |
 
-## Concurrency, Stats & Logging
+
+## Concurrency & Telemetry
 | Option                  | Description                                      | Example                                                   |
 | ----------------------- | ------------------------------------------------ | --------------------------------------------------------- |
 | `--max-workers N`       | Max concurrent fetch workers                     | `python3 darkSpecter.py urls.txt "key" --max-workers 10`  |
@@ -92,6 +101,7 @@
 | `--crawl-log`           | Show each page fetch and enqueue in real-time    | `python3 darkSpecter.py urls.txt "key" --crawl-log`       |
 
 ## Putting It All Together
+### Example command combining several options:
 ```
 python3 darkSpecter.py urls.txt "ransomware" \
     -o matches.txt --json --json-out matches.json --regex \
