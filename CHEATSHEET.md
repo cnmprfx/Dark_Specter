@@ -43,7 +43,7 @@
 | `--rotate-every N`    | Rotate Tor circuit after N pages (0 disables) | `--rotate-every 50`     |
 | `--random-ua`         | Randomize User-Agent header on each request   | `--random-ua`           |
 
-*Note:* `--rotate-every` needs Tor control-port access (and `--control-pass` if set) to request a new circuit. `--random-ua` simply randomizes the User-Agent each request.
+>*Note:* `--rotate-every` needs Tor control-port access (and `--control-pass` if set) to request a new circuit. `--random-ua` simply randomizes the User-Agent each request.
 ## Verbosity, TLS & Debug
 | Option         | Purpose                                              | Example        |
 | -------------- | ---------------------------------------------------- | -------------- |
@@ -90,7 +90,7 @@
 | `--shot-mode matches\|all`                          | Capture only matched pages or all pages (default `matches`) | `--shot-mode all`        |
 | `--render-timeout MS`                               | Page navigation timeout in milliseconds (default 30000)     | `--render-timeout 60000` |
 | `--render-wait load\|domcontentloaded\|networkidle` | Playwright `wait_until` condition (default `networkidle`)   | `--render-wait load`     |
-> if adding screenshots to the crawl set `--render-timout` to a low number to avoid hanging on exit.
+>*Note:* if adding screenshots to the crawl set `--render-timout` to a low number to avoid hanging on exit.
 
 ## Concurrency & Telemetry
 | Option                  | Description                                      | Example                                                   |
