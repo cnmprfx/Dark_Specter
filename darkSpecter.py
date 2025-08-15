@@ -955,8 +955,7 @@ def main():
     matcher = build_matcher(args.phrase, args.regex)
 
     out_path = pathlib.Path(args.out)
-    visited, matched = set(), set()
-    parent_map, json_records = {}, []
+    
     compiled_excludes = compile_exclude_patterns(args.exclude_domains)
 
     # Render settings (only used inside render thread if --shots)
@@ -966,10 +965,15 @@ def main():
         "wait_until": args.render_wait,
         "timeout_ms": args.render_timeout,
     }
+
     limiter = PageLimiter(args.max_pages)
+    all_matched = set()
+    all_json_records = []
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
         limiter.reset()
+        visited, matched = set(), set()
+        parent_map, json_records = {}, []
         crawl_recursive(
             session_router=session_router,
             root_url=seed,
@@ -1002,18 +1006,19 @@ def main():
             control_pass=args.control_pass,
             ua_pool=USER_AGENTS if args.random_ua else None,
         )
-
-    out_path.write_text("\n".join(sorted(matched)) + ("\n" if matched else ""), encoding="utf-8")
+        all_matched.update(matched)
+        all_json_records.extend(json_records)
+    out_path.write_text("\n".join(sorted(all_matched)) + ("\n" if all_matched else ""), encoding="utf-8")
     if args.json:
         with open(args.json_out, "w", encoding="utf-8") as jf:
             json.dump({
                 "phrase": args.phrase,
                 "regex": bool(args.regex),
-                "total_matches": len(matched),
-                "matches": json_records
+                "total_matches": len(all_matched),
+                "matches": all_json_records
             }, jf, indent=2, ensure_ascii=False)
 
-    print(f"\nDone. {len(matched)} matches → {out_path}"
+    print(f"\nDone. {len(all_matched)} matches → {out_path}"
           + (f"  |  JSON → {args.json_out}" if args.json else ""))
 
 if __name__ == "__main__":
