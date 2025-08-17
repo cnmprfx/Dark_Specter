@@ -251,7 +251,7 @@ class CrawlStats:
         self.matched = 0
         self.max_depth = 0
         self.fetched = 0
-
+        self.fails = 0
     def on_visit(self, depth):
         with self.lock:
             self.visited += 1
@@ -261,6 +261,10 @@ class CrawlStats:
     def on_fetch(self):
         with self.lock:
             self.fetched += 1
+
+    def on_fail(self):
+        with self.lock:
+            self.fails += 1
 
     def on_match(self):
         with self.lock:
@@ -273,6 +277,7 @@ class CrawlStats:
                 "matched": self.matched,
                 "max_depth": self.max_depth,
                 "fetched": self.fetched,
+                "fails": self.fails,
                 "elapsed": max(0.001, time.time() - self.start),
             }
 
@@ -302,8 +307,8 @@ def _stats_printer(queue, stats: CrawlStats, stop_evt: threading.Event, interval
         
         rate = snap["fetched"] / snap["elapsed"]
         line = (f"[stats] visited={visited_count} queued={pending} matched={matched_count} "
-                f"workers={workers} depth={snap['max_depth']} rate={rate:.2f}/s "
-                f"elapsed={int(snap['elapsed'])}s")
+                f"fails={snap['fails']} workers={workers} depth={snap['max_depth']} "
+                f"rate={rate:.2f}/s elapsed={int(snap['elapsed'])}s")
         if use_cr:
             print("\r" + line + " " * 10, end="", flush=True)
         else:
@@ -621,6 +626,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                                 rotate_tor_circuit(control_host, control_port, control_pass)
 
                     if not txt:
+                        stats.on_fail()
                         print(f"{DIM}[fail]{RESET} {url}")
                         continue
 
