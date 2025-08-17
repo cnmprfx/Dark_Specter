@@ -39,8 +39,8 @@
 
 ```bash
 # Clone repo
-git clone https://github.com/cnmprfx/dark_specter.git
-cd dark_specter
+git clone https://github.com/cnmprfx/Dark_Specter.git
+cd Dark_Specter
 
 # Install dependencies
 pip install -r requirements.txt
