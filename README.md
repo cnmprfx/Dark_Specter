@@ -23,7 +23,7 @@
 - **Recursive Spidering** – Crawl entire onion or clearnet sites up to a specified depth
 - **Regex or Simple Match** – Match exact phrases or full regex patterns
 - **Auth Support** – Supply session cookies or credentials per URL
-- **Live Stats** – Real-time `visited / queued / matched / depth / rate / elapsed` output
+- **Live Stats** – Real-time `visited / queued / matched / fails / depth / rate / elapsed` output
 - **Domain Exclusion** – Skip specific domains or patterns (supports regex)
 - **Multithreaded Crawling** – Adjustable `--max-workers` for speed
 - **Screenshot & Rendering** – Capture matches or all visited pages
@@ -119,12 +119,13 @@ python3 darkSpecter.py urls.txt "Keyword/Phrase" \
 When `--stats-interval` > 0, Dark Specter will print:
 
 ```
-[stats] visited=38 queued=21 matched=5 depth=4 rate=0.78/s elapsed=49s
+[stats] visited=38 queued=21 matched=5 fails=2 depth=4 rate=0.78/s elapsed=49s
 ```
 
 * **visited** – Pages fetched
 * **queued** – Pages waiting in queue
 * **matched** – Pages matching keyword/regex
+* **fails** – Pages that could not be fetched
 * **depth** – Max depth reached so far
 * **rate** – Fetch rate in pages/sec
 * **elapsed** – Crawl time in seconds
