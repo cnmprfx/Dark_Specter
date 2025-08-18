@@ -11,7 +11,7 @@
 import argparse, sys, time, random, pathlib, json, os, re, threading, traceback, socket, contextlib
 import warnings
 import requests
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urldefrag
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from bs4 import XMLParsedAsHTMLWarning
@@ -56,9 +56,17 @@ USER_AGENTS = [
 
 
 # ===== Helpers =====
+def normalize_url(url: str) -> str:
+    """Strip URL fragments so the same page isn't fetched multiple times."""
+    try:
+        clean, _ = urldefrag(url)
+        return clean
+    except Exception:
+        return url
+
 def load_urls(path):
     with open(path, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+        return [normalize_url(line.strip()) for line in f if line.strip() and not line.strip().startswith("#")]
 
 def make_base_session(socks_host="127.0.0.1", socks_port=9050, ua=None):
     s = requests.Session()
@@ -184,7 +192,9 @@ def make_soup(html, content_type=None):
 
 def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False, exclude_patterns=None):
     exclude_patterns = exclude_patterns or []
-    
+
+    base_url = normalize_url(base_url)
+
     links = set()
     soup = make_soup(html)
 
@@ -193,20 +203,21 @@ def extract_links(base_url, html, allow_offdomain=False, allow_subdomains=False,
         href = (a.get("href") or "").strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
-        links.add(urljoin(base_url, href))
+        links.add(normalize_url(urljoin(base_url, href)))
 
     # <area>
     for ar in soup.find_all("area", href=True):
         href = (ar.get("href") or "").strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
-        links.add(urljoin(base_url, href))
+        links.add(normalize_url(urljoin(base_url, href)))
 
     # plain text URLs
     for m in PLAIN_URL_RE.finditer(html or ""):
-        links.add(m.group(0))
+        links.add(normalize_url(m.group(0)))
 
     # Scope filtering
+    links = {normalize_url(u) for u in links}
     filtered = set()
     for abs_url in links:
         try:
@@ -569,6 +580,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
         while not stop_evt.is_set():
             try:
                 url, depth, parent = queue.get(timeout=0.5)
+                url = normalize_url(url)
             except Empty:
                 continue
             except Exception as e:
@@ -709,7 +721,8 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                     verbose=False, save_debug=False, max_workers=5, stats_interval=2.0,
                     limiter=None, render_settings=None, rotate_every=0, control_host="127.0.0.1",
                     control_port=9051, control_pass=None, ua_pool=None, render_queue_timeout=5.0):
-
+    
+    root_url = normalize_url(root_url)
     q = Queue()
     q.put((root_url, 0, None))
 
