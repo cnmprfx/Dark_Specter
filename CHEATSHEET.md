@@ -1,4 +1,4 @@
-# Dark Spectre Cheat Sheet
+# Dark Specter Cheat Sheet
 ### Run the crawler with a URL list and search phrase, adding any desired options:
 ```python darkSpecter.py URL_LIST PHRASE [options]```
 ## Core
