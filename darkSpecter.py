@@ -674,9 +674,14 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                         )
                         enq = 0
                         for link in children:
+                            if stop_evt.is_set():
+                                break
                             with VISITED_LOCK:
                                 already_visited = (link in visited)
-                                total_known = len(visited) + queue.unfinished_tasks
+                                visited_count = len(visited)
+                            with INFLIGHT_LOCK:
+                                inflight = INFLIGHT
+                            total_known = visited_count + queue.unfinished_tasks - inflight
                             if limiter.max_pages > 0 and total_known >= limiter.max_pages:
                                 break
                             with PARENT_LOCK:
@@ -693,6 +698,9 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                                     print(f"{'  '*(depth+1)}[enqueue] {link}")
                         if crawl_log:
                             print(f"{'  '*depth}[links] extracted={len(children)} enqueued={enq} depth={depth+1}")
+                        
+                        if stop_evt.is_set():
+                            break
 
                     if delay > 0:
                         time.sleep(delay + random.uniform(0, 0.8))
@@ -1042,3 +1050,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
