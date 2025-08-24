@@ -28,6 +28,7 @@ ROTATE_LOCK = threading.Lock()
 ROTATE_COUNT = 0
 ACTIVE_WORKERS = 0
 ACTIVE_WORKERS_LOCK = threading.Lock()
+QUEUE_SENTINEL = object()
 
 # ===== ANSI Colors =====
 RED="\033[91m"; PURPLE="\033[95m"; DIM="\033[2m"; RESET="\033[0m"
@@ -39,10 +40,10 @@ ASCII_BANNER = rf"""
 {RED} | |_| | (_| | |  |   <     {PURPLE}___) | |_) |  __/ (__| ||  __/ |
 {RED} |____/ \__,_|_|  |_|\_\   {PURPLE}|____/| .__/ \___|\___|\__\___|_|
 {PURPLE}                                 |_|
-{RESET}                ==== {RED}Dark {PURPLE}Spectre{RESET} - Tor Keyword Hunter ====
+{RESET}                ==== {RED}Dark {PURPLE}Specter{RESET} - Tor Keyword Hunter ====
 """
 
-DESCRIPTION = f"""{RED}Dark Spectre{RESET} hunts for keywords/regex on darknet & clearnet URLs via Tor.
+DESCRIPTION = f"""{RED}Dark Specter{RESET} hunts for keywords/regex on darknet & clearnet URLs via Tor.
 It spiders entire apps by default (keeps crawling even when a page doesn't match).
 Supports: regex, JSON reports, global/per-URL auth, verbose/debug, live stats, rendering & screenshots.
 """
@@ -579,8 +580,7 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
     try:
         while not stop_evt.is_set():
             try:
-                url, depth, parent = queue.get(timeout=6.0)
-                url = normalize_url(url)
+                item = queue.get(timeout=6.0)
             except Empty:
                 if queue.empty():
                     break
@@ -588,6 +588,11 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
             except Exception as e:
                 print(f"[worker get] {type(e).__name__}: {e}")
                 break
+            if item is QUEUE_SENTINEL:
+                queue.task_done()
+                break
+            url, depth, parent = item
+            url = normalize_url(url)
             with queue_task_done(queue):
                 with INFLIGHT_LOCK:
                     global INFLIGHT
@@ -605,12 +610,17 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                                 print(f"{DIM}[limit]{RESET} max-pages reached, stopping crawl")
                             stop_evt.set()
                     if not allowed:
+                        queue.task_done()
                         while True:
                             try:
                                 queue.get_nowait()
                                 queue.task_done()
                             except Empty:
                                 break
+                        with ACTIVE_WORKERS_LOCK:
+                            remaining_workers = ACTIVE_WORKERS - 1
+                        for _ in range(remaining_workers):
+                            queue.put(QUEUE_SENTINEL)
                         break
                     stats.on_visit(depth)
 
@@ -820,35 +830,32 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
         render_thread.start()
 
     # Crawl workers
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for _ in range(max_workers):
-            executor.submit(
-                crawl_worker, q, session_router, matcher, matched, visited, parent_map, json_records,
-                max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
-                follow_only_if_match, crawl_log, delay, timeout, verify_tls, verbose, save_debug,
-                stats, limiter, stop_evt, render_queue, shots, shot_mode, ua_pool,
-                rotate_every, control_host, control_port, control_pass
-            )
-        q.join()
-        executor.shutdown(wait=True)
-        # Wait for all tasks to complete or bail if stop is triggered
-        while not stop_evt.is_set():
-            if q.unfinished_tasks == 0:
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    for _ in range(max_workers):
+        executor.submit(
+            crawl_worker, q, session_router, matcher, matched, visited, parent_map, json_records,
+            max_depth, allow_offdomain, allow_subdomains, exclude_patterns,
+            follow_only_if_match, crawl_log, delay, timeout, verify_tls, verbose, save_debug,
+            stats, limiter, stop_evt, render_queue, shots, shot_mode, ua_pool,
+            rotate_every, control_host, control_port, control_pass
+        )
+    # Wait for queue to empty but allow timeout/stop conditions
+    join_thread = threading.Thread(target=q.join, daemon=True)
+    join_thread.start()
+    join_thread.join(timeout=5.0)
+    if join_thread.is_alive() or stop_evt.is_set():
+        # Drain any remaining items so unfinished_tasks reaches zero
+        while True:
+            try:
+                q.get_nowait()
+                q.task_done()
+            except Empty:
                 break
-            time.sleep(0.1)
-
-    # Queue drained: signal workers/stats thread to exit
-        
-        
-   # Ensure no leftover items keep the queue's task counter from reaching zero
-    while True:
-        try:
-            q.get_nowait()
-            q.task_done()
-        except Empty:
-            break
+        # Ensure the join thread exits now that the queue is drained
+        join_thread.join()
 
     stop_evt.set()
+    executor.shutdown(wait=True)
     #executor.shutdown(wait=False, cancel_futures=True)
    # Signal shutdown for stats + render threads
     if render_queue:
