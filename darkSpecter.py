@@ -852,7 +852,7 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
             except Empty:
                 break
         # Ensure the join thread exits now that the queue is drained
-        join_thread.join(timeout=6)
+        join_thread.join(timeout=0.5)
 
     stop_evt.set()
     executor.shutdown(wait=True)
