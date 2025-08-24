@@ -579,9 +579,11 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
     try:
         while not stop_evt.is_set():
             try:
-                url, depth, parent = queue.get(timeout=0.5)
+                url, depth, parent = queue.get(timeout=6.0)
                 url = normalize_url(url)
             except Empty:
+                if queue.empty():
+                    break
                 continue
             except Exception as e:
                 print(f"[worker get] {type(e).__name__}: {e}")
@@ -830,7 +832,8 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
         q.join()
 
     # Queue drained: signal workers/stats thread to exit
-        stop_evt.set()
+        
+    stop_evt.set()
    
    # Signal shutdown for stats + render threads
     if render_queue:
