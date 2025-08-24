@@ -830,11 +830,25 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
                 rotate_every, control_host, control_port, control_pass
             )
         q.join()
+        # Wait for all tasks to complete or bail if stop is triggered
+        while not stop_evt.is_set():
+            if q.unfinished_tasks == 0:
+                break
+            time.sleep(0.1)
 
     # Queue drained: signal workers/stats thread to exit
         
+        
+   # Ensure no leftover items keep the queue's task counter from reaching zero
+    while True:
+        try:
+            q.get_nowait()
+            q.task_done()
+        except Empty:
+            break
+
     stop_evt.set()
-   
+    executor.shutdown(wait=False, cancel_futures=True)
    # Signal shutdown for stats + render threads
     if render_queue:
         if render_queue and render_thread and render_active and render_thread.is_alive():
@@ -1053,4 +1067,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
