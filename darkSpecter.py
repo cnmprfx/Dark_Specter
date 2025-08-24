@@ -842,7 +842,7 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
     # Wait for queue to empty but allow timeout/stop conditions
     join_thread = threading.Thread(target=q.join, daemon=True)
     join_thread.start()
-    join_thread.join(timeout=5.0)
+    join_thread.join()
     if join_thread.is_alive() or stop_evt.is_set():
         # Drain any remaining items so unfinished_tasks reaches zero
         while True:
@@ -852,7 +852,7 @@ def crawl_recursive(session_router, root_url, matcher, matched, visited, parent_
             except Empty:
                 break
         # Ensure the join thread exits now that the queue is drained
-        join_thread.join()
+        join_thread.join(timeout=6)
 
     stop_evt.set()
     executor.shutdown(wait=True)
