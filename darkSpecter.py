@@ -658,11 +658,12 @@ def crawl_worker(queue, session_router, matcher, matched, visited, parent_map, j
                     match = matcher(txt)
                     if match:
                         with MATCHED_LOCK:
-                            matched.add(url)
+                            matched[url] = match.group(0)
                         print(f"{RED}{'  '*depth}[MATCH]{RESET} {url} -- {match.group(0)}")
                         json_records.append({
                             "url": url, "depth": depth, "parent": parent,
-                            "chain": chain_for(url, parent_map)
+                            "chain": chain_for(url, parent_map),
+                            "match": match.group(0),
                         })
                         # Schedule screenshot on match (matches mode)
                         if shots and shot_mode == "matches" and render_queue is not None and not stop_evt.is_set():
@@ -1019,12 +1020,12 @@ def main():
     }
 
     limiter = PageLimiter(args.max_pages)
-    all_matched = set()
+    all_matched = {}
     all_json_records = []
     for seed in urls:
         print(f"{PURPLE}[*]{RESET} seed: {seed}")
         limiter.reset()
-        visited, matched = set(), set()
+        visited, matched = set(), {}
         parent_map, json_records = {}, []
         crawl_recursive(
             session_router=session_router,
@@ -1060,7 +1061,12 @@ def main():
         )
         all_matched.update(matched)
         all_json_records.extend(json_records)
-    out_path.write_text("\n".join(sorted(all_matched)) + ("\n" if all_matched else ""), encoding="utf-8")
+    out_path.write_text(
+        "\n".join(
+            f"{url}\t{phrase}" for url, phrase in sorted(all_matched.items())
+        ) + ("\n" if all_matched else ""),
+        encoding="utf-8",
+    )
     if args.json:
         with open(args.json_out, "w", encoding="utf-8") as jf:
             json.dump({
@@ -1075,4 +1081,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
